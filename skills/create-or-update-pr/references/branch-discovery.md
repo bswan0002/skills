@@ -16,6 +16,10 @@ Run `scripts/pr-context.py` relative to the skill directory, with the target wor
 
 The helper never ranks every branch by nearest merge-base. That can select a sibling, descendant, or the head's own published copy. It also never substitutes the repository default or `HEAD~1` when evidence is absent.
 
+## Publication remote safety
+
+The head remote must have exactly one push destination, and its fetch and push URLs must resolve through `gh` to the same repository. SSH and HTTPS URLs for the same repository are accepted. Multiple push destinations or different fetch/push repositories stop discovery before PR lookup or publication checks. Choose a remote satisfying these constraints with `--head-remote`; split-repository publication is unsupported.
+
 ## Happy path / stop rule
 
 For a new PR, accept either agreeing current-branch metadata and `branch: Created from <parent>`, or a `Created from HEAD`/`@` entry correlated with an unambiguous creation-time HEAD checkout. Any supplied metadata must agree. The live remote parent must exist, the creation commit must belong to both head and parent history, and the parent must not already contain HEAD. With no warnings, use this scope for the proposal and stop discovery.

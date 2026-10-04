@@ -23,6 +23,55 @@ def pr(branch, owner="me"):
             "headRepositoryOwner": {"login": owner}}
 
 
+class PublicationRepositoryTests(unittest.TestCase):
+    def test_same_repository_with_different_url_syntax(self):
+        fetch_url = "git@github.com:me/project.git"
+        push_url = "https://github.com/me/project.git"
+        with patch.object(context, "run", side_effect=[fetch_url, push_url]) as run, \
+                patch.object(context, "gh_json", side_effect=[
+                    {"nameWithOwner": "Me/Project"}, {"nameWithOwner": "me/project"}
+                ]) as gh_json:
+            self.assertEqual(context.publication_repository("fork"), "Me/Project")
+        self.assertEqual(run.call_args_list[0].args, ("git", "remote", "get-url", "fork"))
+        self.assertEqual(run.call_args_list[1].args,
+                         ("git", "remote", "get-url", "--push", "--all", "fork"))
+        self.assertEqual([call.args[2] for call in gh_json.call_args_list],
+                         [fetch_url, push_url])
+
+    def test_split_repositories_stop_discovery(self):
+        with patch.object(context, "run", side_effect=[
+                "https://github.com/upstream/project.git", "git@github.com:me/project.git"
+        ]), patch.object(context, "gh_json", side_effect=[
+                {"nameWithOwner": "upstream/project"}, {"nameWithOwner": "me/project"}
+        ]):
+            with self.assertRaisesRegex(RuntimeError, "fetches from upstream/project but pushes to me/project"):
+                context.publication_repository("origin")
+
+    def test_requires_exactly_one_push_destination(self):
+        url = "https://github.com/me/project.git"
+        for push_urls in ("", f"{url}\nhttps://github.com/other/project.git", f"{url}\n{url}"):
+            with self.subTest(push_urls=push_urls), \
+                    patch.object(context, "run", side_effect=[url, push_urls]), \
+                    patch.object(context, "gh_json") as gh_json:
+                with self.assertRaisesRegex(RuntimeError, "exactly one push destination"):
+                    context.publication_repository("origin")
+                gh_json.assert_not_called()
+
+    def test_push_url_lookup_failure_is_not_ignored(self):
+        with patch.object(context, "run", side_effect=["fetch-url", RuntimeError("push lookup failed")]):
+            with self.assertRaisesRegex(RuntimeError, "push lookup failed"):
+                context.publication_repository("origin")
+
+    def test_repository_lookup_failures_are_not_ignored(self):
+        for responses in ([RuntimeError("fetch identity failed")],
+                          [{"nameWithOwner": "me/project"}, RuntimeError("push identity failed")]):
+            with self.subTest(responses=responses), \
+                    patch.object(context, "run", side_effect=["fetch-url", "push-url"]), \
+                    patch.object(context, "gh_json", side_effect=responses):
+                with self.assertRaisesRegex(RuntimeError, "identity failed"):
+                    context.publication_repository("origin")
+
+
 class DiscoveryTests(unittest.TestCase):
     def discover(self, prs=None, tracking="published-name", tracking_remote="origin",
                  head_branch=None, head_remote=None, base="main", metadata=None,
@@ -81,6 +130,13 @@ class DiscoveryTests(unittest.TestCase):
 
     def queried_branches(self, calls):
         return [c[c.index("--head") + 1] for c in calls if c[:3] == ("gh", "pr", "list")]
+
+    def test_invalid_publication_remote_stops_before_pr_lookup(self):
+        with patch.object(context, "publication_repository", side_effect=RuntimeError("split remote")), \
+                patch.object(context, "open_pr") as open_pr:
+            with self.assertRaisesRegex(RuntimeError, "split remote"):
+                self.discover()
+            open_pr.assert_not_called()
 
     def test_local_pr_takes_priority(self):
         result, calls = self.discover(prs={"local-name": [pr("local-name")]}, base=None)

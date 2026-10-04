@@ -27,6 +27,26 @@ def config(key):
     return run("git", "config", "--get", key, optional=True)
 
 
+def publication_repository(remote):
+    fetch_url = run("git", "remote", "get-url", remote)
+    push_urls = run("git", "remote", "get-url", "--push", "--all", remote).splitlines()
+    if len(push_urls) != 1:
+        raise RuntimeError(
+            f"Remote {remote!r} must have exactly one push destination; found {len(push_urls)}. "
+            "Choose a remote with one push destination using --head-remote."
+        )
+    # Resolve identity through gh: SSH and HTTPS URLs can name the same repository.
+    fetch_repo = gh_json("repo", "view", fetch_url, "--json", "nameWithOwner")["nameWithOwner"]
+    push_repo = gh_json("repo", "view", push_urls[0], "--json", "nameWithOwner")["nameWithOwner"]
+    if fetch_repo.casefold() != push_repo.casefold():
+        raise RuntimeError(
+            f"Remote {remote!r} fetches from {fetch_repo} but pushes to {push_repo}. "
+            "Split fetch/push repositories are unsupported; choose a remote whose fetch and "
+            "push destinations identify the same repository using --head-remote."
+        )
+    return fetch_repo
+
+
 def open_pr(target, head_repo, branch):
     prs = gh_json("pr", "list", "--repo", target, "--head", branch, "--state", "open",
                   "--json", "number,url,title,body,baseRefName,headRefName,headRepositoryOwner,isDraft")
@@ -109,9 +129,7 @@ def discover(args):
         break
     tracking_remote = config(f"branch.{branch}.remote")
     remote = args.head_remote or tracking_remote or "origin"
-    remote_url = run("git", "remote", "get-url", remote)
-    # Resolve repository identity through gh, rather than guessing from SSH/HTTPS URL syntax.
-    head_repo = gh_json("repo", "view", remote_url, "--json", "nameWithOwner")["nameWithOwner"]
+    head_repo = publication_repository(remote)
     head_branch = args.head_branch or branch
     pr = open_pr(target, head_repo, head_branch)
     tracking_pr = None
