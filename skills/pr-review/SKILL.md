@@ -7,42 +7,30 @@ Review the changes intended for merge. Leave code and working-tree files unchang
 
 ## Establish the scope
 
-Read the repository's agent instructions. Inspect the current branch, remotes, and working-tree status. Keep committed changes separate from uncommitted changes; include the latter only when requested.
+Read the repository's agent instructions. From its worktree, run the helper using its absolute path resolved relative to **this skill**, not the target repository:
 
-Choose the base in this order:
+```bash
+python3 /absolute/path/to/pr-review/scripts/pr-context.py
+# Optional: explicit comparison, PR, target repository, or publishing remote
+python3 /absolute/path/to/pr-review/scripts/pr-context.py --base parent-branch
+python3 /absolute/path/to/pr-review/scripts/pr-context.py --pr 123 --repo owner/repo
+```
 
-1. **Explicit base:** use the user's requested branch or commit. If it differs from an existing PR's target, state that this is a custom comparison.
-2. **Open PR:** use its target branch in its target repository. For the current branch, start with:
+Requires Python 3.9+, git, and authenticated gh for GitHub discovery. The helper is read-only: it reports status, remotes, PR lookup results, parent evidence, and fixed-commit diff commands. It never fetches or guesses a parent. A nonzero exit means the local comparison is not ready; read the JSON reason.
 
-   ```bash
-   gh pr view --json url,state,baseRefName,baseRefOid,headRefName,headRefOid
-   ```
+Choose the base in this order: **user-specified base → open PR's target → unambiguous, history-corroborated local parent evidence → ask**. The helper resolves the first two; evaluate its raw metadata/reflogs for the third and rerun with `--base` only once the parent is established. Creation from `HEAD` needs checkout-history correlation. Conflicting or incomplete evidence requires clarification.
 
-   For a supplied PR URL or number, inspect that PR explicitly. Verify its state and repository/head identity; a closed or merged PR is not an open-PR fallback. An explicitly requested closed or merged PR needs its actual PR diff, not a comparison against today's target branch.
-3. **Local parent evidence:** inspect branch-base metadata and the branch creation reflog. Examples of metadata are `branch.<name>.gh-merge-base`, `branch.<name>.vscode-merge-base`, and `branch.<name>.github-pr-base-branch`. Use a parent only when the evidence is unambiguous, the ref resolves, and history corroborates it. A creation entry from `HEAD` needs the corresponding checkout history to identify the branch.
-4. **Uncertain:** ask which branch or commit to compare against before reviewing.
+Verify the reported target and head repository identities. `--head-remote` overrides the publishing remote (tracking remote, otherwise origin); `--repo` overrides gh's target repository. A tracking upstream, nearest merge-base, conventional branch name, or `HEAD~1` does not establish the parent.
 
-Distinguish a confirmed absence of an open PR from failed lookup, missing authentication, or unavailable tooling. Surface lookup failures; use another source only if it independently establishes the scope.
-
-Tracking upstream usually names the published copy of the current branch, not its parent. The nearest merge-base, a conventional branch name such as `main`, and `HEAD~1` are not sufficient evidence of the intended target. Conflicting or missing evidence calls for clarification, not a best guess.
+Surface lookup errors rather than treating them as no PR. Another source may establish scope independently. Explicit bases resolve locally: check remote freshness separately when reviewing against a live remote branch. Disclose a custom comparison if the requested base differs from the PR target.
 
 ## Resolve the comparison
 
-Verify the base repository rather than assuming `origin` is correct, especially for forks. Resolve the current target commit using that repository. If fetching is needed, fetch only the required branch from the verified remote; fetching Git objects/refs is allowed, but leave the checkout, index, and working-tree files unchanged. Report fetch failures instead of silently treating stale refs as current.
+If the helper reports missing objects, verify its suggested fetch source, fetch only the required refs, and rerun. Fetching Git objects/refs is allowed; leave the checkout, index, and working-tree files unchanged. Report failures instead of silently using stale refs. If objects remain unavailable, use the GitHub PR diff and disclose limits on surrounding context.
 
-For a local branch review, use the committed local `HEAD`. For an explicit PR review, use the PR's head; local `HEAD` may be ahead, behind, or unrelated. If PR objects cannot be obtained locally, inspect the PR diff through GitHub and disclose any limits on surrounding context.
+The default reviews committed local `HEAD`; `--pr` reviews the published PR head. Closed/merged PRs use the historical PR diff unless a custom base was requested. Keep uncommitted changes separate and include them only when requested.
 
-Resolve base and head to commit IDs and use those fixed IDs throughout the review:
-
-```bash
-git diff --stat <base-sha>...<head-sha>
-git diff --name-status <base-sha>...<head-sha>
-git diff <base-sha>...<head-sha>
-```
-
-Three-dot compares the head with its merge-base against the target, excluding target-only changes. If the refs or merge-base cannot be resolved, stop and explain what is missing.
-
-State the base, head, source of the base selection, and any scope exclusions before presenting findings.
+Use the emitted fixed-SHA commands throughout the review. Three-dot excludes target-only changes. Stop if the comparison cannot be resolved. State base, head, selection evidence, and scope exclusions before presenting findings.
 
 ## Review
 
