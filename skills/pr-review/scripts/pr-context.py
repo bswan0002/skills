@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""Read-only review discovery. Python 3.9+, git, and optionally authenticated gh."""
+"""Discover a published GitHub PR for read-only review. Requires authenticated gh."""
 
 import argparse
 import json
-import os
-import re
 import shlex
 import subprocess
 import sys
-from urllib.parse import quote
+from urllib.parse import urlsplit
 
 
 class DiscoveryError(Exception):
@@ -16,43 +14,10 @@ class DiscoveryError(Exception):
 
 
 def run(*args):
-    result = subprocess.run(args, text=True, capture_output=True, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+    result = subprocess.run(args, text=True, capture_output=True)
     if result.returncode:
         raise DiscoveryError(f"{shlex.join(args)}: {result.stderr.strip() or 'command failed'}")
     return result.stdout.strip()
-
-
-def optional(*args):
-    try:
-        return run(*args)
-    except DiscoveryError:
-        return None
-
-
-def github_repo(url):
-    match = re.fullmatch(r"(?:https?://github\.com/|ssh://git@github\.com/|git@github\.com:)([^/]+/[^/]+?)(?:\.git)?/?", url)
-    return match.group(1) if match else None
-
-
-def commit(ref):
-    return optional("git", "rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}")
-
-
-def parent_evidence(branch):
-    if not branch:
-        return {}
-    metadata = {}
-    for key in ("gh-merge-base", "vscode-merge-base", "github-pr-base-branch"):
-        value = optional("git", "config", "--get", f"branch.{branch}.{key}")
-        if value:
-            metadata[key] = {"value": value, "local_commit": commit(value)}
-    # Raw, timestamped evidence, not an inferred parent. HEAD creation requires
-    # checkout correlation; expired/rebased reflogs may not establish a parent.
-    return {
-        "metadata": metadata,
-        "branch_reflog": optional("git", "reflog", "show", "--date=iso-strict", "--format=%H %gD %gs", branch),
-        "head_checkouts": optional("git", "reflog", "show", "-n", "100", "--date=iso-strict", "--format=%H %gD %gs", "HEAD"),
-    }
 
 
 PR_FIELDS = "number,url,state,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner"
@@ -64,16 +29,34 @@ def pr_head_repository(pr):
     return f"{owner}/{name}" if owner and name else None
 
 
-def lookup_pr(repo, branch, head_repo, requested=None):
+def target_repository(pr):
+    url = urlsplit(pr["url"])
+    if url.hostname != "github.com":
+        raise DiscoveryError("Only github.com PRs are supported")
+    return "/".join(url.path.strip("/").split("/")[:2])
+
+
+def discover_pr(requested=None, repo=None):
+    """Let gh resolve the association; verify uniqueness among open matches."""
     if requested:
-        pr = json.loads(run("gh", "pr", "view", requested, "--repo", repo, "--json", PR_FIELDS))
-        # A URL must identify a PR in the selected target repository.
-        if not pr["url"].lower().startswith(f"https://github.com/{repo}/pull/".lower()):
+        args = ["gh", "pr", "view", requested, "--json", PR_FIELDS]
+        if repo:
+            args += ["--repo", repo]
+        pr = json.loads(run(*args))
+        target = target_repository(pr)
+        if repo and target.casefold() != repo.casefold():
             raise DiscoveryError("PR URL and target repository disagree; pass --repo for the URL's repository")
-        return {"status": "found", "pr": pr}
-    if not branch or not head_repo:
-        return {"status": "unavailable", "reason": "Cannot verify current branch's GitHub head repository; use --head-remote or --pr"}
-    prs = json.loads(run("gh", "pr", "list", "--repo", repo, "--state", "open", "--head", branch, "--limit", "1000", "--json", PR_FIELDS))
+        return {"status": "found", "repository": target, "pr": pr}
+    if repo:
+        return {"status": "needs_pr", "reason": "An explicit target repository requires --pr"}
+    candidate = json.loads(run("gh", "pr", "status", "--json", PR_FIELDS))["currentBranch"]
+    if not candidate:
+        return {"status": "needs_pr", "reason": "gh could not identify a PR; specify --pr"}
+    target = target_repository(candidate)
+    head_repo = pr_head_repository(candidate)
+    if not head_repo:
+        raise DiscoveryError("Cannot verify candidate's head repository; specify --pr")
+    prs = json.loads(run("gh", "pr", "list", "--repo", target, "--state", "open", "--head", candidate["headRefName"], "--limit", "1000", "--json", PR_FIELDS))
     if len(prs) >= 1000:
         raise DiscoveryError("PR lookup may be truncated; inspect an explicit PR instead")
     matches = []
@@ -81,211 +64,29 @@ def lookup_pr(repo, branch, head_repo, requested=None):
         identity = pr_head_repository(pr)
         if not identity:
             raise DiscoveryError("PR lookup returned unverifiable head repository identity")
-        if pr["headRefName"] == branch and identity.lower() == head_repo.lower():
+        if pr["headRefName"] == candidate["headRefName"] and identity.casefold() == head_repo.casefold():
             matches.append(pr)
     if len(matches) > 1:
-        return {"status": "ambiguous", "prs": matches}
-    return {"status": "found", "pr": matches[0]} if matches else {"status": "absent"}
+        return {"status": "ambiguous", "repository": target, "prs": matches}
+    if not matches:
+        return {"status": "needs_pr", "repository": target, "reason": "No verified open match; specify --pr"}
+    return {"status": "found", "repository": target, "pr": matches[0]}
 
-
-SHALLOW_CAUSES = {
-    "no_merge_base": (
-        "Both tips exist, but shallow history may hide their common ancestor",
-        "Do not infer unrelated histories while the repository remains shallow.",
-    ),
-    "hidden_merge_base": (
-        "A merge-base was found, but a shallow boundary may hide a newer one",
-        "Do not review against the visible merge-base while these boundaries remain.",
-    ),
-}
-
-
-def hiding_boundaries(base_sha, head_sha, merge_base):
-    """Shallow boundary commits that could hide a newer merge-base.
-
-    A cut below the merge-base hides only older ancestors, so only boundaries
-    reachable from a tip but not from the merge-base matter.
-    """
-    with open(run("git", "rev-parse", "--git-path", "shallow")) as handle:
-        shallow = set(handle.read().split())
-    between = run("git", "rev-list", base_sha, head_sha, f"^{merge_base}").split()
-    return [sha for sha in between if sha in shallow]
-
-
-def incomplete_history(base_sha, head_sha, cause):
-    reason, caution = SHALLOW_CAUSES[cause]
-    return {
-        "status": "incomplete_history", "cause": cause, "base_sha": base_sha, "head_sha": head_sha,
-        "reason": reason,
-        "recovery": "Deepen only the comparison histories from a verified source, then rerun discovery. Repeat with a larger increment if necessary; no fetch was performed.",
-        "command_templates": [shlex.join([
-            "git", "fetch", "--no-tags", "--deepen=100", "<verified-source>", base_sha, head_sha,
-        ])],
-        "note": "Replace the source placeholder before running. If it cannot serve these commits (for example local-only work), deepen the remote branches containing their ancestors instead. " + caution,
-    }
-
-
-def comparison(base_sha, head_sha):
-    missing = [sha for sha in (base_sha, head_sha) if not commit(sha)]
-    if missing:
-        return {
-            "status": "missing_objects", "base_sha": base_sha, "head_sha": head_sha, "commits": missing,
-            "reason": "Comparison commits are not present locally",
-            "command_templates": [shlex.join(["git", "fetch", "--no-tags", "<verified-source>", *missing])],
-            "note": "Replace the source placeholder with a remote verified to hold these commits, fetch, then rerun discovery; no fetch was performed.",
-        }
-    shallow = run("git", "rev-parse", "--is-shallow-repository") == "true"
-    merge_base = optional("git", "merge-base", base_sha, head_sha)
-    if not merge_base:
-        if shallow:
-            return incomplete_history(base_sha, head_sha, "no_merge_base")
-        return {"status": "no_merge_base", "base_sha": base_sha, "head_sha": head_sha,
-                "reason": "Full history has no common ancestor: the base is wrong or the histories are unrelated"}
-    if shallow:
-        boundaries = hiding_boundaries(base_sha, head_sha, merge_base)
-        if boundaries:
-            result = incomplete_history(base_sha, head_sha, "hidden_merge_base")
-            result.update({"visible_merge_base": merge_base, "shallow_boundaries": boundaries})
-            return result
-    span = f"{base_sha}...{head_sha}"
-    return {
-        "status": "ready", "base_sha": base_sha, "head_sha": head_sha,
-        "merge_base": merge_base,
-        "commands": [shlex.join(["git", "diff", *flags, span]) for flags in (["--stat"], ["--name-status"], [])],
-    }
-
-
-def publishing_remote(branch, remotes, explicit=None):
-    """Infer the remote that publishes the branch; returns (remote, source).
-
-    Follows git's push-remote precedence, but this is an inference, not exact git
-    behavior: push.default=nothing, remote.<name>.push refspecs, and matching
-    pushes can publish differently.
-    """
-    if explicit:
-        if explicit not in remotes:
-            raise DiscoveryError(f"Unknown head remote: {explicit}")
-        return explicit, "--head-remote"
-    if branch:
-        candidates = [
-            ("pushRemote", optional("git", "config", "--get", f"branch.{branch}.pushRemote")),
-            ("remote.pushDefault", optional("git", "config", "--get", "remote.pushDefault")),
-        ]
-        # The tracking remote publishes the branch when an implicit push sends it
-        # there under its own name: a same-named tracked branch, or push.default=current.
-        # Otherwise (tracking upstream/main under simple or upstream) git refuses or
-        # pushes it as another branch, so the tracking remote is following a parent.
-        same_name = optional("git", "config", "--get", f"branch.{branch}.merge") == f"refs/heads/{branch}"
-        if same_name or optional("git", "config", "--get", "push.default") == "current":
-            candidates.append(("tracking", optional("git", "config", "--get", f"branch.{branch}.remote")))
-        for source, name in candidates:
-            if name in remotes:
-                return name, source
-    return ("origin", "origin") if "origin" in remotes else (None, None)
-
-
-def discover(args):
-    root = run("git", "rev-parse", "--show-toplevel")
-    branch = run("git", "branch", "--show-current")
-    head = run("git", "rev-parse", "HEAD")
-    remote_names = run("git", "remote").splitlines()
-    remotes = {name: run("git", "remote", "get-url", name) for name in remote_names}
-    head_remote, head_remote_source = publishing_remote(branch, remotes, args.head_remote)
-    # Pushes go to the push URL, which may differ from the fetch URL.
-    head_repo = github_repo(run("git", "remote", "get-url", "--push", head_remote)) if head_remote else None
-    result = {
-        "repository_root": root, "branch": branch or None, "local_head": head,
-        "working_tree": run("git", "status", "--short"), "remotes": remotes,
-        "head_remote": {"name": head_remote, "source": head_remote_source},
-        "head_repository": head_repo, "parent_evidence": parent_evidence(branch),
-        "errors": [],
-    }
-    repo = args.repo
-    # An explicit local comparison remains usable if gh is unavailable.
-    try:
-        repo = repo or json.loads(run("gh", "repo", "view", "--json", "nameWithOwner"))["nameWithOwner"]
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
-            raise DiscoveryError("Expected a GitHub repository in owner/name form")
-        result["target_repository"] = repo
-        result["pr_lookup"] = lookup_pr(repo, branch, head_repo, args.pr)
-    except (DiscoveryError, OSError, ValueError, KeyError) as exc:
-        result["pr_lookup"] = {"status": "failed", "reason": str(exc)}
-        result["errors"].append(str(exc))
-    lookup = result["pr_lookup"]
-    pr = lookup.get("pr")
-    if args.pr and not pr:
-        result["comparison"] = {"status": "blocked", "reason": "Explicit PR could not be verified"}
-        return result
-    if args.pr:
-        # The reviewed head is the PR's, so its identity comes from the PR, not
-        # the local branch's remote (a fork PR may have no local remote at all).
-        result["local_head_repository"] = head_repo
-        result["head_repository"] = pr_head_repository(pr)
-        if not result["head_repository"]:
-            result["head_repository_note"] = "PR head repository is unavailable (for example, a deleted fork); the head commit remains reachable through the PR ref"
-    if args.pr and pr["state"] != "OPEN" and not args.base:
-        result["comparison"] = {
-            "status": "historical_pr", "reason": "Use the historical PR diff, not today's target branch",
-            "head_sha": pr["headRefOid"],
-            "commands": [shlex.join(["gh", "pr", "diff", str(pr["number"]), "--repo", repo])],
-        }
-        if not commit(pr["headRefOid"]):
-            result["comparison"]["suggested_fetches"] = [shlex.join([
-                "git", "fetch", "--no-tags", f"https://github.com/{repo}.git", f"refs/pull/{pr['number']}/head",
-            ])]
-            result["comparison"]["note"] = "head_sha is not local; fetch it to read surrounding code, then rerun discovery. No fetch was performed."
-        return result
-    review_head = pr["headRefOid"] if args.pr else head
-    if args.base:
-        base_sha = commit(args.base)
-        result["base_selection"] = {"source": "explicit", "ref": args.base, "sha": base_sha, "freshness": "local; not checked against remote"}
-        result["comparison"] = comparison(base_sha, review_head) if base_sha else {"status": "blocked", "reason": "Explicit base does not resolve locally"}
-    elif pr and pr["state"] == "OPEN":
-        try:
-            # Query the target repository directly; neither origin nor a local
-            # tracking ref establishes its current tip. This does not fetch.
-            endpoint = f"repos/{repo}/git/ref/heads/{quote(pr['baseRefName'], safe='')}"
-            base_sha = json.loads(run("gh", "api", endpoint))["object"]["sha"]
-            result["base_selection"] = {"source": "open_pr", "ref": pr["baseRefName"], "sha": base_sha, "repository": repo}
-            result["comparison"] = comparison(base_sha, review_head)
-            if result["comparison"]["status"] == "incomplete_history":
-                result["comparison"].pop("command_templates")
-                result["comparison"]["suggested_fetches"] = [shlex.join([
-                    "git", "fetch", "--no-tags", "--deepen=100", f"https://github.com/{repo}.git",
-                    f"refs/heads/{pr['baseRefName']}", f"refs/pull/{pr['number']}/head",
-                ])]
-                result["comparison"]["note"] = "Verify the source before fetching. For local unpublished work, additional ancestor history may be needed from its publishing remote. " + SHALLOW_CAUSES[result["comparison"]["cause"]][1]
-            if result["comparison"]["status"] == "missing_objects":
-                result["comparison"].pop("command_templates")
-                fetch_refs = [f"refs/heads/{pr['baseRefName']}"]
-                if args.pr:
-                    fetch_refs.append(f"refs/pull/{pr['number']}/head")
-                result["comparison"]["suggested_fetches"] = [
-                    shlex.join(["git", "fetch", "--no-tags", f"https://github.com/{repo}.git", ref]) for ref in fetch_refs
-                ]
-                result["comparison"]["note"] = "Fetch only if allowed, then rerun discovery; no fetch was performed."
-        except (DiscoveryError, OSError, ValueError, KeyError) as exc:
-            result["errors"].append(str(exc))
-            result["comparison"] = {"status": "blocked", "reason": "Could not resolve live PR target"}
-    else:
-        result["comparison"] = {"status": "needs_base", "reason": "Evaluate parent evidence; rerun with --base only after establishing or asking for the intended base"}
-    return result
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base", help="User-specified or independently verified local ref/commit")
-    parser.add_argument("--repo", help="GitHub target repository: owner/name")
-    parser.add_argument("--pr", help="Explicit PR number or URL (use --repo for another repository)")
-    parser.add_argument("--head-remote", help="Remote identifying the current branch's publishing repository (unused with --pr)")
+    parser.add_argument("--pr", help="PR number or URL; otherwise discover the current branch's PR")
+    parser.add_argument("--repo", help="Target owner/name, used with --pr")
     args = parser.parse_args()
     try:
-        result = discover(args)
+        result = discover_pr(args.pr, args.repo)
+        if result["status"] == "found":
+            result["diff_command"] = shlex.join(["gh", "pr", "diff", result["pr"]["url"]])
     except (DiscoveryError, OSError, ValueError, KeyError) as exc:
-        print(json.dumps({"errors": [str(exc)], "comparison": {"status": "blocked", "reason": "Discovery failed before a comparison could be built; see errors"}}, indent=2))
-        return 1
+        result = {"status": "failed", "reason": str(exc)}
     print(json.dumps(result, indent=2))
-    return 0 if result["comparison"]["status"] in ("ready", "historical_pr") else 1
+    return 0 if result["status"] == "found" else 1
 
 
 if __name__ == "__main__":

@@ -1,12 +1,10 @@
 """Run with: python3 -B -m unittest discover -s skills/pr-review/scripts -v"""
 
-import argparse
+import io
 import importlib.util
 import json
-import os
 from pathlib import Path
-import subprocess
-import tempfile
+from contextlib import redirect_stdout, redirect_stderr
 import unittest
 from unittest.mock import patch
 
@@ -23,426 +21,169 @@ def pr(owner="me", state="OPEN"):
 
 
 class LookupTests(unittest.TestCase):
-    def test_repository_urls(self):
-        for url in ("git@github.com:me/project.git", "https://github.com/me/project.git", "ssh://git@github.com/me/project.git"):
-            self.assertEqual(context.github_repo(url), "me/project")
-        self.assertIsNone(context.github_repo("https://example.com/me/project"))
+    def lookup(self, candidate=None, prs=(), requested=None, repo=None):
+        def fake_run(*args):
+            if args[1:3] == ("pr", "status"):
+                return json.dumps({"currentBranch": candidate})
+            if args[1:3] == ("pr", "list"):
+                self.assertIn(candidate["headRefName"], args)
+                self.assertIn("team/project", args)
+                self.assertIn("open", args)
+                return json.dumps(prs)
+            if args[1:3] == ("pr", "view"):
+                return json.dumps(candidate)
+            raise AssertionError(args)
+        with patch.object(context, "run", side_effect=fake_run) as run:
+            result = context.discover_pr(requested, repo)
+        return result, run
 
-    def test_filters_other_forks(self):
-        with patch.object(context, "run", return_value=json.dumps([pr("other"), pr()])):
-            result = context.lookup_pr("team/project", "feature", "me/project")
+    def test_filters_other_forks_repositories_and_branches(self):
+        other_repo = pr()
+        other_repo["headRepository"]["name"] = "different"
+        other_branch = pr()
+        other_branch["headRefName"] = "different"
+        result, run = self.lookup(pr(), [pr("other"), other_repo, other_branch, pr()])
         self.assertEqual(result["pr"]["headRepositoryOwner"]["login"], "me")
+        self.assertEqual(result["repository"], "team/project")
+        self.assertEqual(run.call_count, 2)
 
-    def test_confirmed_absence(self):
-        with patch.object(context, "run", return_value="[]"):
-            self.assertEqual(context.lookup_pr("team/project", "feature", "me/project")["status"], "absent")
+    def test_case_insensitive_repository_identity(self):
+        result, _ = self.lookup(pr("ME"), [pr("me")])
+        self.assertEqual(result["status"], "found")
+
+    def test_null_candidate_requires_input_not_claimed_absence(self):
+        result, run = self.lookup()
+        self.assertEqual(result["status"], "needs_pr")
+        self.assertEqual(run.call_count, 1)
+
+    def test_no_open_match_requires_input(self):
+        result, _ = self.lookup(pr(state="MERGED"))
+        self.assertEqual(result["status"], "needs_pr")
+
+    def test_historical_candidate_can_discover_open_match(self):
+        result, _ = self.lookup(pr(state="MERGED"), [pr()])
+        self.assertEqual(result["pr"]["state"], "OPEN")
 
     def test_lookup_failure_is_not_absence(self):
         with patch.object(context, "run", side_effect=context.DiscoveryError("auth failed")):
             with self.assertRaises(context.DiscoveryError):
-                context.lookup_pr("team/project", "feature", "me/project")
+                context.discover_pr()
 
-    def test_ambiguous_prs(self):
-        with patch.object(context, "run", return_value=json.dumps([pr(), pr()])):
-            self.assertEqual(context.lookup_pr("team/project", "feature", "me/project")["status"], "ambiguous")
+    def test_ambiguous_bases(self):
+        release = pr()
+        release.update(number=2, baseRefName="release")
+        result, _ = self.lookup(pr(), [pr(), release])
+        self.assertEqual(result["status"], "ambiguous")
+        self.assertEqual(len(result["prs"]), 2)
+
+    def test_truncation_blocks(self):
+        with self.assertRaises(context.DiscoveryError):
+            self.lookup(pr(), [pr()] * 1000)
+
+    def test_missing_head_identity_blocks(self):
+        deleted = pr()
+        deleted["headRepository"] = None
+        with self.assertRaises(context.DiscoveryError):
+            self.lookup(deleted)
+        with self.assertRaises(context.DiscoveryError):
+            self.lookup(pr(), [deleted])
+
+    def test_explicit_repo_requires_pr(self):
+        with patch.object(context, "run") as run:
+            result = context.discover_pr(repo="team/project")
+        self.assertEqual(result["status"], "needs_pr")
+        run.assert_not_called()
 
     def test_explicit_pr_repository_mismatch(self):
-        with patch.object(context, "run", return_value=json.dumps(pr())):
-            with self.assertRaises(context.DiscoveryError):
-                context.lookup_pr("wrong/project", "feature", "me/project", "1")
+        with self.assertRaises(context.DiscoveryError):
+            self.lookup(pr(), requested="1", repo="wrong/project")
+
+    def test_explicit_url_uses_its_repository_without_local_repo_lookup(self):
+        result, run = self.lookup(pr(state="MERGED"), requested=pr()["url"])
+        self.assertEqual(result["repository"], "team/project")
+        self.assertEqual(result["pr"]["state"], "MERGED")
+        run.assert_called_once_with("gh", "pr", "view", pr()["url"], "--json", context.PR_FIELDS)
+
+    def test_explicit_number_passes_repo(self):
+        result, run = self.lookup(pr(), requested="1", repo="team/project")
+        self.assertEqual(result["status"], "found")
+        self.assertIn("--repo", run.call_args.args)
+
+    def test_other_host_blocks_before_cloud_api_or_fetch_guidance(self):
+        enterprise = pr()
+        enterprise["url"] = "https://github.example.com/team/project/pull/1"
+        for requested in (None, enterprise["url"]):
+            with self.subTest(requested=requested):
+                with self.assertRaises(context.DiscoveryError):
+                    self.lookup(enterprise, requested=requested)
 
 
-def isolate_git_config(test):
-    # Global settings such as push.default would otherwise change results.
-    env = patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
-    env.start()
-    test.addCleanup(env.stop)
 
+class MainTests(unittest.TestCase):
+    def invoke(self, args=(), result=None, error=None):
+        stdout = io.StringIO()
+        with patch("sys.argv", ["pr-context.py", *args]), redirect_stdout(stdout):
+            with patch.object(context, "discover_pr", return_value=result, side_effect=error) as discover:
+                code = context.main()
+        return code, json.loads(stdout.getvalue()), discover
 
-class RepositoryTests(unittest.TestCase):
-    def setUp(self):
-        isolate_git_config(self)
-        self.temp = tempfile.TemporaryDirectory()
-        self.previous = os.getcwd()
-        os.chdir(self.temp.name)
-        self.git("init", "-b", "main")
-        self.git("config", "user.name", "Test")
-        self.git("config", "user.email", "test@example.com")
-        Path("file").write_text("base\n")
-        self.git("add", "file")
-        self.git("commit", "-m", "base")
-        self.base = self.git("rev-parse", "HEAD")
-        self.git("switch", "-c", "feature")
-        Path("file").write_text("base\nfeature\n")
-        self.git("commit", "-am", "feature")
-        self.head = self.git("rev-parse", "HEAD")
-        self.git("remote", "add", "origin", "git@github.com:me/project.git")
-        self.real_run = context.run
+    def test_found_emits_one_published_pr_diff_command(self):
+        code, result, discover = self.invoke(result={
+            "status": "found", "repository": "team/project", "pr": pr(),
+        })
+        self.assertEqual(code, 0)
+        self.assertEqual(result["diff_command"], "gh pr diff https://github.com/team/project/pull/1")
+        self.assertNotIn("comparison", result)
+        self.assertNotIn("local_head", result)
+        discover.assert_called_once_with(None, None)
 
-    def tearDown(self):
-        os.chdir(self.previous)
-        self.temp.cleanup()
+    def test_explicit_selection_passed_through(self):
+        _, _, discover = self.invoke(
+            ("--pr", "1", "--repo", "team/project"),
+            result={"status": "found", "repository": "team/project", "pr": pr()},
+        )
+        discover.assert_called_once_with("1", "team/project")
 
-    def git(self, *args):
-        return subprocess.check_output(["git", *args], text=True, stderr=subprocess.DEVNULL).strip()
+    def test_missing_or_ambiguous_pr_has_no_diff_command(self):
+        for status in ("needs_pr", "ambiguous"):
+            with self.subTest(status=status):
+                code, result, _ = self.invoke(result={"status": status})
+                self.assertEqual(code, 1)
+                self.assertNotIn("diff_command", result)
 
-    def discover(self, prs=None, base=None, requested=None, fail=False, live_base=None, fail_api=False):
-        def fake_run(*args):
-            if args[0] != "gh":
-                return self.real_run(*args)
-            if fail:
-                raise context.DiscoveryError("network failed")
-            if args[1:3] == ("pr", "list"):
-                return json.dumps(prs or [])
-            if args[1:3] == ("pr", "view"):
-                return json.dumps(prs[0])
-            if args[1] == "api":
-                if fail_api:
-                    raise context.DiscoveryError("live base lookup failed")
-                return json.dumps({"object": {"sha": live_base or self.base}})
-            raise AssertionError(args)
-        args = argparse.Namespace(repo="team/project", base=base, pr=requested, head_remote=None)
-        with patch.object(context, "run", side_effect=fake_run):
-            return context.discover(args)
+    def test_errors_are_reported_not_absence(self):
+        for error in (context.DiscoveryError("auth failed"), FileNotFoundError("gh missing")):
+            with self.subTest(error=error):
+                code, result, _ = self.invoke(error=error)
+                self.assertEqual(code, 1)
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["reason"], str(error))
 
-    def test_explicit_base_works_without_gh(self):
-        result = self.discover(base="main", fail=True)
-        self.assertEqual(result["comparison"]["status"], "ready")
-        self.assertEqual(result["pr_lookup"]["status"], "failed")
-        self.assertEqual(result["comparison"]["base_sha"], self.base)
+    def test_list_failure_does_not_use_status_candidate(self):
+        stdout = io.StringIO()
+        with patch("sys.argv", ["pr-context.py"]), redirect_stdout(stdout):
+            with patch.object(context, "run", side_effect=[
+                json.dumps({"currentBranch": pr()}), context.DiscoveryError("list failed"),
+            ]):
+                code = context.main()
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(stdout.getvalue())["status"], "failed")
 
-    def test_no_guess_from_tracking_or_nearby_branch(self):
-        self.git("branch", "nearby", "HEAD~1")
-        self.git("config", "branch.feature.remote", "origin")
-        self.git("config", "branch.feature.merge", "refs/heads/feature")
-        result = self.discover()
-        self.assertEqual(result["comparison"]["status"], "needs_base")
-        self.assertIn("branch_reflog", result["parent_evidence"])
+    def test_explicit_closed_pr_uses_same_diff_path(self):
+        code, result, _ = self.invoke(
+            ("--pr", "1"),
+            result={"status": "found", "repository": "team/project", "pr": pr(state="MERGED")},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(result["diff_command"], "gh pr diff https://github.com/team/project/pull/1")
 
-    def test_open_pr_uses_live_base_and_local_head(self):
-        result = self.discover(prs=[pr()])
-        self.assertEqual(result["comparison"]["base_sha"], self.base)
-        self.assertEqual(result["comparison"]["head_sha"], self.head)
-
-    def test_explicit_pr_uses_published_head(self):
-        data = pr()
-        data["headRefOid"] = self.base
-        result = self.discover(prs=[data], requested="1")
-        self.assertEqual(result["comparison"]["head_sha"], self.base)
-
-    def track_upstream_main(self):
-        # Fork workflow: the branch tracks the parent on upstream, publishes to origin.
-        self.git("remote", "add", "upstream", "git@github.com:team/project.git")
-        self.git("config", "branch.feature.remote", "upstream")
-        self.git("config", "branch.feature.merge", "refs/heads/main")
-
-    def assert_publishes_to_fork(self, result, source):
-        self.assertEqual(result["head_remote"]["source"], source)
-        self.assertEqual(result["head_repository"], "me/project")
-        self.assertEqual(result["pr_lookup"]["status"], "found")
-
-    def test_push_remote_beats_tracking_remote(self):
-        self.track_upstream_main()
-        self.git("config", "branch.feature.pushRemote", "origin")
-        self.assert_publishes_to_fork(self.discover(prs=[pr()]), "pushRemote")
-
-    def test_push_default_beats_tracking_remote(self):
-        self.track_upstream_main()
-        self.git("config", "remote.pushDefault", "origin")
-        self.assert_publishes_to_fork(self.discover(prs=[pr()]), "remote.pushDefault")
-
-    def test_tracking_parent_branch_is_not_publishing(self):
-        self.track_upstream_main()
-        self.assert_publishes_to_fork(self.discover(prs=[pr()]), "origin")
-
-    def test_push_default_current_publishes_to_tracking_remote(self):
-        self.track_upstream_main()
-        self.git("config", "push.default", "current")
-        result = self.discover(prs=[pr("team")])
-        self.assertEqual(result["head_remote"], {"name": "upstream", "source": "tracking"})
-        self.assertEqual(result["head_repository"], "team/project")
-        self.assertEqual(result["pr_lookup"]["status"], "found")
-
-    def test_tracking_same_named_branch_is_publishing(self):
-        self.git("remote", "add", "upstream", "git@github.com:team/project.git")
-        self.git("config", "branch.feature.remote", "upstream")
-        self.git("config", "branch.feature.merge", "refs/heads/feature")
-        result = self.discover(prs=[pr()])
-        self.assertEqual(result["head_remote"], {"name": "upstream", "source": "tracking"})
-        self.assertEqual(result["head_repository"], "team/project")
-
-    def test_push_url_overrides_fetch_url(self):
-        self.git("remote", "set-url", "--push", "origin", "git@github.com:pusher/project.git")
-        result = self.discover(prs=[pr("pusher")])
-        self.assertEqual(result["head_repository"], "pusher/project")
-        self.assertEqual(result["pr_lookup"]["status"], "found")
-
-    def test_fork_pr_reports_pr_head_repository(self):
-        data = pr("contributor")
-        data["headRefOid"] = self.head
-        result = self.discover(prs=[data], requested="1")
-        self.assertEqual(result["comparison"]["status"], "ready")
-        self.assertEqual(result["head_repository"], "contributor/project")
-        self.assertEqual(result["local_head_repository"], "me/project")
-
-    def test_historical_fork_pr_reports_pr_head_repository(self):
-        result = self.discover(prs=[pr("contributor", state="MERGED")], requested="1")
-        self.assertEqual(result["comparison"]["status"], "historical_pr")
-        self.assertEqual(result["head_repository"], "contributor/project")
-
-    def test_deleted_fork_pr_head_repository_is_unavailable(self):
-        data = pr()
-        data["headRepository"] = None
-        data["headRefOid"] = self.head
-        result = self.discover(prs=[data], requested="1")
-        self.assertEqual(result["comparison"]["status"], "ready")
-        self.assertIsNone(result["head_repository"])
-        self.assertIn("deleted fork", result["head_repository_note"])
-
-    def test_branch_review_keeps_local_head_repository(self):
-        result = self.discover(prs=[pr()])
-        self.assertEqual(result["head_repository"], "me/project")
-        self.assertNotIn("local_head_repository", result)
-
-    def test_historical_pr_does_not_use_live_target(self):
-        result = self.discover(prs=[pr(state="MERGED")], requested="1")
-        self.assertEqual(result["comparison"]["status"], "historical_pr")
-        self.assertEqual(result["comparison"]["head_sha"], "published-head")
-        self.assertIn("refs/pull/1/head", result["comparison"]["suggested_fetches"][0])
-
-    def test_historical_pr_with_local_head_needs_no_fetch(self):
-        data = pr(state="MERGED")
-        data["headRefOid"] = self.head
-        result = self.discover(prs=[data], requested="1")["comparison"]
-        self.assertEqual(result["head_sha"], self.head)
-        self.assertNotIn("suggested_fetches", result)
-
-    def test_explicit_base_overrides_historical_target(self):
-        data = pr(state="MERGED")
-        data["headRefOid"] = self.head
-        result = self.discover(prs=[data], requested="1", base="main")
-        self.assertEqual(result["comparison"]["status"], "ready")
-        self.assertEqual(result["base_selection"]["source"], "explicit")
-
-    def test_draft_pr_is_still_open(self):
-        data = pr()
-        data["isDraft"] = True
-        data["headRefOid"] = self.head
-        self.assertEqual(self.discover(prs=[data], requested="1")["comparison"]["status"], "ready")
-
-    def test_live_lookup_failure_does_not_use_stale_base(self):
-        result = self.discover(prs=[pr()], fail_api=True)
-        self.assertEqual(result["comparison"]["status"], "blocked")
-        self.assertTrue(result["errors"])
-
-    def test_invalid_explicit_base_blocks(self):
-        self.assertEqual(self.discover(base="nonexistent")["comparison"]["status"], "blocked")
-
-    def test_fork_pr_fetch_uses_target_pull_ref(self):
-        result = self.discover(prs=[pr()], requested="1")
-        fetches = result["comparison"]["suggested_fetches"]
-        self.assertIn("https://github.com/team/project.git refs/pull/1/head", fetches[1])
-
-    def test_missing_objects_report_fetch_without_mutation(self):
-        before = self.git("show-ref")
-        result = self.discover(prs=[pr()], live_base="a" * 40)
-        self.assertEqual(result["comparison"]["status"], "missing_objects")
-        self.assertIn("team/project.git", result["comparison"]["suggested_fetches"][0])
-        self.assertNotIn("command_templates", result["comparison"])
-        self.assertEqual(self.git("show-ref"), before)
-
-    def test_missing_objects_with_explicit_base_has_template(self):
-        data = pr()
-        data["headRefOid"] = "b" * 40
-        result = self.discover(prs=[data], requested="1", base="main")["comparison"]
-        self.assertEqual(result["status"], "missing_objects")
-        self.assertEqual(result["command_templates"], [f"git fetch --no-tags '<verified-source>' {'b' * 40}"])
-        self.assertTrue(result["reason"])
-
-    def test_linked_worktree(self):
-        path = str(Path(self.temp.name) / "linked")
-        self.git("worktree", "add", "-b", "linked-branch", path, "HEAD")
-        os.chdir(path)
-        result = self.discover(base="main")
-        self.assertEqual(result["comparison"]["status"], "ready")
-
-    def shallow_clone(self):
-        # Diverging tips share the original base only in full history.
-        self.git("switch", "main")
-        Path("main-file").write_text("main work\n")
-        self.git("add", "main-file")
-        self.git("commit", "-m", "main work")
-        main_tip = self.git("rev-parse", "HEAD")
-        source = Path.cwd().as_uri()
-        clone = str(Path(self.temp.name) / "shallow-clone")
-        self.git("clone", "--depth=1", "--no-single-branch", source, clone)
-        os.chdir(clone)
-        self.git("switch", "feature")
-        return source, main_tip
-
-    def test_shallow_history_recovers_after_scoped_deepening(self):
-        source, main_tip = self.shallow_clone()
-        self.assertEqual(self.git("rev-parse", "--is-shallow-repository"), "true")
-        self.assertEqual(context.commit(main_tip), main_tip)
-        self.assertEqual(context.commit(self.head), self.head)
-        before = (self.git("show-ref"), self.git("status", "--porcelain"), Path(".git/shallow").read_text())
-        result = self.discover(base=main_tip, fail=True)["comparison"]
-        self.assertEqual(result["status"], "incomplete_history")
-        self.assertEqual(result["cause"], "no_merge_base")
-        self.assertIn("--deepen=100", result["command_templates"][0])
-        self.assertEqual(before, (self.git("show-ref"), self.git("status", "--porcelain"), Path(".git/shallow").read_text()))
-        self.git("fetch", "--no-tags", "--deepen=100", source, main_tip, self.head)
-        recovered = self.discover(base=main_tip, fail=True)["comparison"]
-        self.assertEqual(recovered["status"], "ready")
-        self.assertEqual(recovered["merge_base"], self.base)
-
-    def commit_file(self, name):
-        Path(name).write_text(f"{name}\n")
-        self.git("add", name)
-        self.git("commit", "-m", name)
-        return self.git("rev-parse", "HEAD")
-
-    def test_shallow_boundary_hiding_newer_merge_base(self):
-        # main: base -> upstream -> p1 -> p2 -> merge(side off base); feature off upstream.
-        # A depth-3 main reaches base through side but cuts p1 from upstream, so the
-        # visible merge-base is base while the real one is upstream.
-        self.git("switch", "main")
-        upstream = self.commit_file("upstream")
-        self.git("switch", "-C", "feature")
-        self.commit_file("feature-file")
-        self.git("switch", "main")
-        self.commit_file("p1")
-        self.commit_file("p2")
-        self.git("switch", "-c", "side", self.base)
-        self.commit_file("side")
-        self.git("switch", "main")
-        self.git("merge", "--no-edit", "side")
-        main_tip = self.git("rev-parse", "HEAD")
-        source = Path.cwd().as_uri()
-        clone = str(Path(self.temp.name) / "hidden-base")
-        self.git("clone", "--depth=3", "--single-branch", "-b", "main", source, clone)
-        os.chdir(clone)
-        self.git("fetch", source, "feature:feature")
-        self.git("switch", "feature")
-        self.assertEqual(self.git("merge-base", main_tip, "HEAD"), self.base)
-
-        result = self.discover(base=main_tip, fail=True)["comparison"]
-        self.assertEqual(result["status"], "incomplete_history")
-        self.assertEqual(result["cause"], "hidden_merge_base")
-        self.assertEqual(result["visible_merge_base"], self.base)
-        self.assertTrue(result["shallow_boundaries"])
-        self.assertIn("visible merge-base", result["note"])
-
-        self.git("fetch", "--no-tags", "--deepen=100", source, "main", "feature")
-        recovered = self.discover(base=main_tip, fail=True)["comparison"]
-        self.assertEqual(recovered["status"], "ready")
-        self.assertEqual(recovered["merge_base"], upstream)
-
-    def test_shallow_clone_with_visible_merge_base_stays_ready(self):
-        # Linear main deeper than the clone; the feature branch starts inside the depth.
-        self.git("switch", "main")
-        for index in range(6):
-            self.commit_file(f"m{index}")
-        fork_point = self.git("rev-parse", "HEAD")
-        self.git("switch", "-c", "recent", fork_point)
-        self.commit_file("recent-file")
-        self.git("switch", "main")
-        self.commit_file("m-after")
-        source = Path.cwd().as_uri()
-        clone = str(Path(self.temp.name) / "visible-base")
-        self.git("clone", "--depth=4", "--no-single-branch", source, clone)
-        os.chdir(clone)
-        self.git("switch", "recent")
-        self.assertEqual(self.git("rev-parse", "--is-shallow-repository"), "true")
-        result = self.discover(base="origin/main", fail=True)["comparison"]
-        self.assertEqual(result["status"], "ready")
-        self.assertEqual(result["merge_base"], fork_point)
-
-    def test_shallow_pr_has_scoped_target_fetch(self):
-        _, main_tip = self.shallow_clone()
-        self.git("remote", "set-url", "origin", "git@github.com:me/project.git")
-        result = self.discover(prs=[pr()], live_base=main_tip)["comparison"]
-        self.assertEqual(result["status"], "incomplete_history")
-        self.assertNotIn("command_templates", result)
-        self.assertIn("--deepen=100 https://github.com/team/project.git refs/heads/main refs/pull/1/head", result["suggested_fetches"][0])
-
-    def test_unrelated_histories_block(self):
-        self.git("switch", "--orphan", "unrelated")
-        self.git("commit", "--allow-empty", "-m", "unrelated")
-        result = self.discover(base="main")["comparison"]
-        self.assertEqual(result["status"], "no_merge_base")
-        self.assertTrue(result["reason"])
-
-
-class PushOracleTests(unittest.TestCase):
-    """Check publishing-remote inference against real implicit pushes to local bare repositories."""
-
-    def setUp(self):
-        isolate_git_config(self)
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.previous = os.getcwd()
-        self.addCleanup(os.chdir, self.previous)
-
-    def git(self, *args, check=True):
-        result = subprocess.run(["git", *args], text=True, capture_output=True)
-        if check and result.returncode:
-            raise AssertionError(result.stderr)
-        return result
-
-    def repo(self, name, tracked="main", config=()):
-        root = Path(self.temp.name) / name
-        self.bare = {remote: str(root / f"{remote}.git") for remote in ("upstream", "origin")}
-        for path in self.bare.values():
-            self.git("init", "-q", "--bare", "-b", "main", path)
-        work = root / "work"
-        self.git("init", "-q", "-b", "main", str(work))
-        os.chdir(work)
-        self.git("config", "user.name", "Test")
-        self.git("config", "user.email", "test@example.com")
-        self.git("commit", "-q", "--allow-empty", "-m", "base")
-        for remote, path in self.bare.items():
-            self.git("remote", "add", remote, path)
-        self.git("push", "-q", "upstream", f"main:{tracked}")
-        self.git("fetch", "-q", "upstream")
-        self.git("switch", "-q", "-c", "feature", "--track", f"upstream/{tracked}")
-        self.git("commit", "-q", "--allow-empty", "-m", "feature")
-        for key, value in config:
-            self.git("config", key, value)
-
-    def published_to(self):
-        """Remotes where an implicit `git push` published `feature` at HEAD."""
-        self.git("push", "-q", check=False)
-        head = self.git("rev-parse", "HEAD").stdout.strip()
-        return {remote for remote, path in self.bare.items()
-                if self.git("--git-dir", path, "rev-parse", "--verify", "-q", "refs/heads/feature", check=False).stdout.strip() == head}
-
-    def inferred(self):
-        remotes = {name: self.git("remote", "get-url", name).stdout.strip() for name in self.bare}
-        return context.publishing_remote("feature", remotes)[0]
-
-    def test_inference_matches_implicit_push(self):
-        cases = [
-            ("current", "main", [("push.default", "current")]),
-            ("pushRemote", "main", [("branch.feature.pushRemote", "origin")]),
-            ("pushDefault", "main", [("remote.pushDefault", "origin")]),
-            ("same-name tracking", "feature", []),
-        ]
-        for name, tracked, config in cases:
-            with self.subTest(name):
-                self.repo(name.replace(" ", "-"), tracked, config)
-                inferred = self.inferred()
-                self.assertEqual(self.published_to(), {inferred})
-
-    def test_no_implicit_publish_falls_back_to_origin(self):
-        # Git refuses (simple) or publishes under the tracked name (upstream):
-        # neither publishes `feature`, so the inference falls back to origin.
-        for name, config in (("simple", []), ("upstream-mode", [("push.default", "upstream")])):
-            with self.subTest(name):
-                self.repo(name, "main", config)
-                inferred = self.inferred()
-                self.assertEqual(self.published_to(), set())
-                self.assertEqual(inferred, "origin")
+    def test_removed_local_comparison_flags_are_rejected(self):
+        for flag in ("--base", "--head-remote"):
+            with self.subTest(flag=flag):
+                with patch("sys.argv", ["pr-context.py", flag, "main"]), redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as error:
+                        context.main()
+                self.assertEqual(error.exception.code, 2)
 
 
 if __name__ == "__main__":
