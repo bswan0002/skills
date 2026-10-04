@@ -122,6 +122,33 @@ class RepositoryTests(unittest.TestCase):
         result = self.discover(prs=[data], requested="1")
         self.assertEqual(result["comparison"]["head_sha"], self.base)
 
+    def test_fork_pr_reports_pr_head_repository(self):
+        data = pr("contributor")
+        data["headRefOid"] = self.head
+        result = self.discover(prs=[data], requested="1")
+        self.assertEqual(result["comparison"]["status"], "ready")
+        self.assertEqual(result["head_repository"], "contributor/project")
+        self.assertEqual(result["local_head_repository"], "me/project")
+
+    def test_historical_fork_pr_reports_pr_head_repository(self):
+        result = self.discover(prs=[pr("contributor", state="MERGED")], requested="1")
+        self.assertEqual(result["comparison"]["status"], "historical_pr")
+        self.assertEqual(result["head_repository"], "contributor/project")
+
+    def test_deleted_fork_pr_head_repository_is_unavailable(self):
+        data = pr()
+        data["headRepository"] = None
+        data["headRefOid"] = self.head
+        result = self.discover(prs=[data], requested="1")
+        self.assertEqual(result["comparison"]["status"], "ready")
+        self.assertIsNone(result["head_repository"])
+        self.assertIn("deleted fork", result["head_repository_note"])
+
+    def test_branch_review_keeps_local_head_repository(self):
+        result = self.discover(prs=[pr()])
+        self.assertEqual(result["head_repository"], "me/project")
+        self.assertNotIn("local_head_repository", result)
+
     def test_historical_pr_does_not_use_live_target(self):
         result = self.discover(prs=[pr(state="MERGED")], requested="1")
         self.assertEqual(result["comparison"]["status"], "historical_pr")

@@ -15,7 +15,7 @@ python3 <skill-dir>/scripts/pr-context.py
 
 Only these establish the base, in order: **user-specified base → open PR's target → unambiguous, history-corroborated local parent evidence → ask the user**. A tracking upstream, nearest merge-base, conventional branch name, or `HEAD~1` is not parent evidence.
 
-On every run, check `pr_lookup` and `errors` whatever the comparison status. A `failed` lookup is an error to report under **Limits**, not an absent PR; for `ambiguous`, ask which PR is meant and rerun with `--pr`. Confirm `target_repository` and `head_repository` name the repositories you mean to review; correct them with `--repo` or `--head-remote`.
+On every run, check `pr_lookup` and `errors` whatever the comparison status. A `failed` lookup is an error to report under **Limits**, not an absent PR; for `ambiguous`, ask which PR is meant and rerun with `--pr`. Confirm `target_repository` and `head_repository` name the repositories you mean to review; correct them with `--repo`, or `--head-remote` for a branch review (with `--pr`, the head repository comes from the PR).
 
 The default reviews committed local `HEAD`; `--pr` reviews the published PR head. Include uncommitted changes only on request, reported separately. When `base_selection.freshness` says the base is local-only, check it against its remote before relying on it.
 

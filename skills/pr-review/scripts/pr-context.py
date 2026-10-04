@@ -58,6 +58,12 @@ def parent_evidence(branch):
 PR_FIELDS = "number,url,state,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner"
 
 
+def pr_head_repository(pr):
+    owner = (pr.get("headRepositoryOwner") or {}).get("login")
+    name = (pr.get("headRepository") or {}).get("name")
+    return f"{owner}/{name}" if owner and name else None
+
+
 def lookup_pr(repo, branch, head_repo, requested=None):
     if requested:
         pr = json.loads(run("gh", "pr", "view", requested, "--repo", repo, "--json", PR_FIELDS))
@@ -72,11 +78,10 @@ def lookup_pr(repo, branch, head_repo, requested=None):
         raise DiscoveryError("PR lookup may be truncated; inspect an explicit PR instead")
     matches = []
     for pr in prs:
-        owner = (pr.get("headRepositoryOwner") or {}).get("login")
-        name = (pr.get("headRepository") or {}).get("name")
-        if not owner or not name:
+        identity = pr_head_repository(pr)
+        if not identity:
             raise DiscoveryError("PR lookup returned unverifiable head repository identity")
-        if pr["headRefName"] == branch and f"{owner}/{name}".lower() == head_repo.lower():
+        if pr["headRefName"] == branch and identity.lower() == head_repo.lower():
             matches.append(pr)
     if len(matches) > 1:
         return {"status": "ambiguous", "prs": matches}
@@ -147,6 +152,13 @@ def discover(args):
     if args.pr and not pr:
         result["comparison"] = {"status": "blocked", "reason": "Explicit PR could not be verified"}
         return result
+    if args.pr:
+        # The reviewed head is the PR's, so its identity comes from the PR, not
+        # the local branch's remote (a fork PR may have no local remote at all).
+        result["local_head_repository"] = head_repo
+        result["head_repository"] = pr_head_repository(pr)
+        if not result["head_repository"]:
+            result["head_repository_note"] = "PR head repository is unavailable (for example, a deleted fork); the head commit remains reachable through the PR ref"
     if args.pr and pr["state"] != "OPEN" and not args.base:
         result["comparison"] = {
             "status": "historical_pr", "reason": "Use the historical PR diff, not today's target branch",
@@ -201,7 +213,7 @@ def main():
     parser.add_argument("--base", help="User-specified or independently verified local ref/commit")
     parser.add_argument("--repo", help="GitHub target repository: owner/name")
     parser.add_argument("--pr", help="Explicit PR number or URL (use --repo for another repository)")
-    parser.add_argument("--head-remote", help="Remote identifying the current branch's publishing repository")
+    parser.add_argument("--head-remote", help="Remote identifying the current branch's publishing repository (unused with --pr)")
     args = parser.parse_args()
     try:
         result = discover(args)
