@@ -27,6 +27,20 @@ def config(key):
     return run("git", "config", "--get", key, optional=True)
 
 
+def open_pr(target, head_repo, branch):
+    prs = gh_json("pr", "list", "--repo", target, "--head", branch, "--state", "open",
+                  "--json", "number,url,title,body,baseRefName,headRefName,headRepositoryOwner,isDraft")
+    owner = head_repo.split("/")[0]
+    matches = [pr for pr in prs if pr["headRefName"] == branch
+               and pr["headRepositoryOwner"]["login"].lower() == owner.lower()]
+    if len(matches) > 1:
+        raise RuntimeError("Multiple matching open PRs; resolve manually.")
+    if not matches:
+        return None
+    return gh_json("pr", "view", str(matches[0]["number"]), "--repo", target, "--json",
+                   "number,url,title,body,baseRefName,headRefName,headRepositoryOwner,isDraft")
+
+
 def ancestor(older, newer):
     result = subprocess.run(
         ["git", "merge-base", "--is-ancestor", older, newer], capture_output=True, text=True
@@ -93,21 +107,27 @@ def discover(args):
         creation = {"sha": sha, "source": message.removeprefix("branch: Created from "),
                     "timestamp": int(timestamp[1])}
         break
-    remote = args.head_remote or config(f"branch.{branch}.remote") or "origin"
+    tracking_remote = config(f"branch.{branch}.remote")
+    remote = args.head_remote or tracking_remote or "origin"
     remote_url = run("git", "remote", "get-url", remote)
     # Resolve repository identity through gh, rather than guessing from SSH/HTTPS URL syntax.
     head_repo = gh_json("repo", "view", remote_url, "--json", "nameWithOwner")["nameWithOwner"]
-    prs = gh_json("pr", "list", "--repo", target, "--head", branch, "--state", "open",
-                  "--json", "number,url,title,body,baseRefName,headRefName,headRepositoryOwner,isDraft")
-    owner = head_repo.split("/")[0]
-    matches = [pr for pr in prs if pr["headRefName"] == branch
-               and pr["headRepositoryOwner"]["login"].lower() == owner.lower()]
-    if len(matches) > 1:
-        raise RuntimeError("Multiple matching open PRs; resolve manually.")
-    pr = matches[0] if matches else None
-    if pr:
-        pr = gh_json("pr", "view", str(pr["number"]), "--repo", target, "--json",
-                     "number,url,title,body,baseRefName,headRefName,headRepositoryOwner,isDraft")
+    head_branch = args.head_branch or branch
+    pr = open_pr(target, head_repo, head_branch)
+    tracking_pr = None
+    warnings = []
+    if not pr and not args.head_branch and remote == tracking_remote:
+        tracking_ref = config(f"branch.{branch}.merge")
+        if tracking_ref and tracking_ref.startswith("refs/heads/"):
+            tracking_branch = tracking_ref.removeprefix("refs/heads/")
+            if tracking_branch != branch:
+                tracking_pr = open_pr(target, head_repo, tracking_branch)
+                if tracking_pr:
+                    warnings.append(
+                        f"Tracking branch {tracking_branch!r} has an open PR ({tracking_pr['url']}). "
+                        "Ask whether to update that PR or publish the local branch separately; "
+                        "rerun with --head-branch set to the confirmed publication branch."
+                    )
 
     remotes = run("git", "remote").splitlines()
 
@@ -142,7 +162,6 @@ def discover(args):
         hints["creation_reflog"] = resolved_creation_source
     candidates = sorted({value for value in hints.values() if value}
                         | {value for value in checkout_parents if value})
-    warnings = []
     base = None
     reason = None
     if args.base:
@@ -166,9 +185,9 @@ def discover(args):
             warnings.append("Parent lacks agreeing metadata/creation evidence or a creation-time HEAD checkout; corroborate manually.")
 
     # ls-remote success with no matching ref means unpublished; failures are not absence.
-    published = run("git", "ls-remote", "--heads", remote, f"refs/heads/{branch}")
+    published = run("git", "ls-remote", "--heads", remote, f"refs/heads/{head_branch}")
     published_sha = published.split()[0] if published else None
-    publication = {"remote": remote, "repository": head_repo, "branch": branch,
+    publication = {"remote": remote, "repository": head_repo, "branch": head_branch,
                    "remote_sha": published_sha, "matches_head": published_sha == head}
     if published_sha and run("git", "cat-file", "-e", f"{published_sha}^{{commit}}", optional=True) is not None:
         publication["local_only_commits"] = int(run("git", "rev-list", "--count", f"{published_sha}..HEAD"))
@@ -178,7 +197,7 @@ def discover(args):
 
     scope = None
     if base:
-        if base == branch and target.lower() == head_repo.lower():
+        if base == head_branch and target.lower() == head_repo.lower():
             raise RuntimeError("Head and base are the same branch in the same repository.")
         # Ref API verifies exact branch existence and gets its live tip without writing refs.
         ref = gh_json("api", f"repos/{target}/git/ref/heads/{quote(base, safe='')}")
@@ -213,7 +232,8 @@ def discover(args):
             "head": branch, "head_sha": head,
             "working_tree": run("git", "status", "--short").splitlines(),
             "upstream": run("git", "rev-parse", "--abbrev-ref", "@{upstream}", optional=True),
-            "publication": publication, "open_pr": pr, "metadata": metadata,
+            "publication": publication, "open_pr": pr, "tracking_pr": tracking_pr,
+            "metadata": metadata,
             "creation": creation, "creation_checkouts": checkouts,
             "parent_candidates": candidates, "base": scope, "warnings": warnings,
             "next_step": "Resolve warnings before proposing publication" if warnings else
@@ -224,6 +244,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", help="Explicit target OWNER/REPO, particularly for forks")
     parser.add_argument("--head-remote", help="Remote holding the head branch; defaults to upstream remote or origin")
+    parser.add_argument("--head-branch", help="User-confirmed publication branch; defaults to the local branch name")
     parser.add_argument("--base", help="User-requested or manually confirmed base branch")
     args = parser.parse_args()
     try:

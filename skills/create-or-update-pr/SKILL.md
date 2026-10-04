@@ -39,7 +39,7 @@ Resolve the absolute path from this `SKILL.md` location. Requires Python 3.9+, g
 
 It returns current-branch metadata and creation reflog, exact-head/owner open PR metadata, publication state, a live remote base SHA, ancestry evidence, and scoped diff commands. It does **not** choose the nearest branch or treat the tracking upstream as a parent. Command/network failures stop discovery rather than masquerading as “no PR.”
 
-1. Resolve any errors/warnings. No open PR is established only by a successful exact-head/owner lookup. Preserve an existing PR and its base; do not create duplicates. Confirm fork head/target identity when relevant.
+1. Resolve any errors/warnings. If `tracking_pr` is present, ask whether to update that PR or publish the local branch separately, then rerun with `--head-branch` set to the confirmed publication branch. No open PR is established only by a successful exact-head/owner lookup. Preserve an existing PR and its base; do not create duplicates. Confirm fork head/target identity when relevant.
 2. Separate committed changes, dirty files, and unpublished commits. PRs contain pushed commits, not the working tree. Never silently stage, commit, amend, rebase, or force-push. If committing is necessary, ask separately.
 3. Inspect the **full diff** using the returned command, relevant surrounding code, and repository PR templates. The JSON summary is not a substitute for reading the diff.
 
@@ -69,8 +69,8 @@ Preserve useful human-written context, links, and required template content when
 ## Publish only after approval
 
 1. Rerun the discovery helper to recheck branch/HEAD, dirty state, publication state, live base SHA, and existing PR metadata before writing. If code or human-written PR content changed since the proposal, reconcile it and seek approval again when the proposal changes. If nothing needs updating, say so instead of performing a write.
-2. Perform only the approved push, if needed. Use an explicit remote/refspec; never force-push or push unrelated branches implicitly.
-3. Put the approved body in a temporary file outside the repository. Use `gh pr create --repo "$repo" --base "$base" --head "$head" --title "$title" --body-file "$bodyFile"` or `gh pr edit "$number" --repo "$repo" --title "$title" --body-file "$bodyFile"`. Use the correct owner-qualified head for forks. Include `--base` on edit only for an approved base change. Do not use `--fill` to replace the approved wording.
+2. Perform only the approved push, if needed. Use an explicit remote/refspec targeting `publication.branch` (for example, `HEAD:refs/heads/<publication-branch>`); never force-push or push unrelated branches implicitly.
+3. Put the approved body in a temporary file outside the repository. Use `gh pr create --repo "$repo" --base "$base" --head "$head" --title "$title" --body-file "$bodyFile"` or `gh pr edit "$number" --repo "$repo" --title "$title" --body-file "$bodyFile"`. Set `$head` from `publication.branch`, using the correct owner-qualified head for forks. Include `--base` on edit only for an approved base change. Do not use `--fill` to replace the approved wording.
 4. Preserve existing draft/ready status, labels, reviewers, and assignees unless a change was approved. Show draft/ready intent in the proposal for new PRs; use `--draft` if agreed.
 5. Verify the resulting PR with `gh pr view` and remove the temporary body file. Perform guidance-required follow-up actions only at the approved lifecycle point and only after the prerequisite PR operation succeeds. Approval of PR publication alone does not authorize undisclosed external changes.
 6. Return the PR URL and outcomes of any approved follow-up actions with a concise confirmation. Report partial failures honestly; a follow-up failure does not undo PR publication. Do not retry creation blindly or merge the PR.
