@@ -248,7 +248,7 @@ def discover(args):
 
     return {"root": root, "repository": target, "default_branch": repo["defaultBranchRef"]["name"],
             "head": branch, "head_sha": head,
-            "working_tree": run("git", "status", "--short").splitlines(),
+            "working_tree": run("git", "--no-optional-locks", "status", "--short").splitlines(),
             "upstream": run("git", "rev-parse", "--abbrev-ref", "@{upstream}", optional=True),
             "publication": publication, "open_pr": pr, "tracking_pr": tracking_pr,
             "metadata": metadata,

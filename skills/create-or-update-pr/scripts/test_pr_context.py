@@ -116,7 +116,7 @@ class DiscoveryTests(unittest.TestCase):
                 return "" if args[-1].startswith(HEAD) else None
             if args[:3] == ("git", "rev-list", "--count"):
                 return "0"
-            if args == ("git", "status", "--short"):
+            if args == ("git", "--no-optional-locks", "status", "--short"):
                 return ""
             if args == ("git", "rev-parse", "--abbrev-ref", "@{upstream}"):
                 return f"{tracking_remote}/{tracking}" if tracking else None
@@ -130,6 +130,12 @@ class DiscoveryTests(unittest.TestCase):
 
     def queried_branches(self, calls):
         return [c[c.index("--head") + 1] for c in calls if c[:3] == ("gh", "pr", "list")]
+
+    def test_working_tree_status_disables_optional_index_writes(self):
+        result, calls = self.discover()
+        self.assertEqual(result["working_tree"], [])
+        self.assertIn(("git", "--no-optional-locks", "status", "--short"), calls)
+        self.assertNotIn(("git", "status", "--short"), calls)
 
     def test_invalid_publication_remote_stops_before_pr_lookup(self):
         with patch.object(context, "publication_repository", side_effect=RuntimeError("split remote")), \
