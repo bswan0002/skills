@@ -52,8 +52,16 @@ class LookupTests(unittest.TestCase):
                 context.lookup_pr("wrong/project", "feature", "me/project", "1")
 
 
+def isolate_git_config(test):
+    # Global settings such as push.default would otherwise change results.
+    env = patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+    env.start()
+    test.addCleanup(env.stop)
+
+
 class RepositoryTests(unittest.TestCase):
     def setUp(self):
+        isolate_git_config(self)
         self.temp = tempfile.TemporaryDirectory()
         self.previous = os.getcwd()
         os.chdir(self.temp.name)
@@ -121,6 +129,53 @@ class RepositoryTests(unittest.TestCase):
         data["headRefOid"] = self.base
         result = self.discover(prs=[data], requested="1")
         self.assertEqual(result["comparison"]["head_sha"], self.base)
+
+    def track_upstream_main(self):
+        # Fork workflow: the branch tracks the parent on upstream, publishes to origin.
+        self.git("remote", "add", "upstream", "git@github.com:team/project.git")
+        self.git("config", "branch.feature.remote", "upstream")
+        self.git("config", "branch.feature.merge", "refs/heads/main")
+
+    def assert_publishes_to_fork(self, result, source):
+        self.assertEqual(result["head_remote"]["source"], source)
+        self.assertEqual(result["head_repository"], "me/project")
+        self.assertEqual(result["pr_lookup"]["status"], "found")
+
+    def test_push_remote_beats_tracking_remote(self):
+        self.track_upstream_main()
+        self.git("config", "branch.feature.pushRemote", "origin")
+        self.assert_publishes_to_fork(self.discover(prs=[pr()]), "pushRemote")
+
+    def test_push_default_beats_tracking_remote(self):
+        self.track_upstream_main()
+        self.git("config", "remote.pushDefault", "origin")
+        self.assert_publishes_to_fork(self.discover(prs=[pr()]), "remote.pushDefault")
+
+    def test_tracking_parent_branch_is_not_publishing(self):
+        self.track_upstream_main()
+        self.assert_publishes_to_fork(self.discover(prs=[pr()]), "origin")
+
+    def test_push_default_current_publishes_to_tracking_remote(self):
+        self.track_upstream_main()
+        self.git("config", "push.default", "current")
+        result = self.discover(prs=[pr("team")])
+        self.assertEqual(result["head_remote"], {"name": "upstream", "source": "tracking"})
+        self.assertEqual(result["head_repository"], "team/project")
+        self.assertEqual(result["pr_lookup"]["status"], "found")
+
+    def test_tracking_same_named_branch_is_publishing(self):
+        self.git("remote", "add", "upstream", "git@github.com:team/project.git")
+        self.git("config", "branch.feature.remote", "upstream")
+        self.git("config", "branch.feature.merge", "refs/heads/feature")
+        result = self.discover(prs=[pr()])
+        self.assertEqual(result["head_remote"], {"name": "upstream", "source": "tracking"})
+        self.assertEqual(result["head_repository"], "team/project")
+
+    def test_push_url_overrides_fetch_url(self):
+        self.git("remote", "set-url", "--push", "origin", "git@github.com:pusher/project.git")
+        result = self.discover(prs=[pr("pusher")])
+        self.assertEqual(result["head_repository"], "pusher/project")
+        self.assertEqual(result["pr_lookup"]["status"], "found")
 
     def test_fork_pr_reports_pr_head_repository(self):
         data = pr("contributor")
@@ -254,6 +309,77 @@ class RepositoryTests(unittest.TestCase):
         result = self.discover(base="main")["comparison"]
         self.assertEqual(result["status"], "no_merge_base")
         self.assertTrue(result["reason"])
+
+
+class PushOracleTests(unittest.TestCase):
+    """Check publishing-remote inference against real implicit pushes to local bare repositories."""
+
+    def setUp(self):
+        isolate_git_config(self)
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.previous = os.getcwd()
+        self.addCleanup(os.chdir, self.previous)
+
+    def git(self, *args, check=True):
+        result = subprocess.run(["git", *args], text=True, capture_output=True)
+        if check and result.returncode:
+            raise AssertionError(result.stderr)
+        return result
+
+    def repo(self, name, tracked="main", config=()):
+        root = Path(self.temp.name) / name
+        self.bare = {remote: str(root / f"{remote}.git") for remote in ("upstream", "origin")}
+        for path in self.bare.values():
+            self.git("init", "-q", "--bare", "-b", "main", path)
+        work = root / "work"
+        self.git("init", "-q", "-b", "main", str(work))
+        os.chdir(work)
+        self.git("config", "user.name", "Test")
+        self.git("config", "user.email", "test@example.com")
+        self.git("commit", "-q", "--allow-empty", "-m", "base")
+        for remote, path in self.bare.items():
+            self.git("remote", "add", remote, path)
+        self.git("push", "-q", "upstream", f"main:{tracked}")
+        self.git("fetch", "-q", "upstream")
+        self.git("switch", "-q", "-c", "feature", "--track", f"upstream/{tracked}")
+        self.git("commit", "-q", "--allow-empty", "-m", "feature")
+        for key, value in config:
+            self.git("config", key, value)
+
+    def published_to(self):
+        """Remotes where an implicit `git push` published `feature` at HEAD."""
+        self.git("push", "-q", check=False)
+        head = self.git("rev-parse", "HEAD").stdout.strip()
+        return {remote for remote, path in self.bare.items()
+                if self.git("--git-dir", path, "rev-parse", "--verify", "-q", "refs/heads/feature", check=False).stdout.strip() == head}
+
+    def inferred(self):
+        remotes = {name: self.git("remote", "get-url", name).stdout.strip() for name in self.bare}
+        return context.publishing_remote("feature", remotes)[0]
+
+    def test_inference_matches_implicit_push(self):
+        cases = [
+            ("current", "main", [("push.default", "current")]),
+            ("pushRemote", "main", [("branch.feature.pushRemote", "origin")]),
+            ("pushDefault", "main", [("remote.pushDefault", "origin")]),
+            ("same-name tracking", "feature", []),
+        ]
+        for name, tracked, config in cases:
+            with self.subTest(name):
+                self.repo(name.replace(" ", "-"), tracked, config)
+                inferred = self.inferred()
+                self.assertEqual(self.published_to(), {inferred})
+
+    def test_no_implicit_publish_falls_back_to_origin(self):
+        # Git refuses (simple) or publishes under the tracked name (upstream):
+        # neither publishes `feature`, so the inference falls back to origin.
+        for name, config in (("simple", []), ("upstream-mode", [("push.default", "upstream")])):
+            with self.subTest(name):
+                self.repo(name, "main", config)
+                inferred = self.inferred()
+                self.assertEqual(self.published_to(), set())
+                self.assertEqual(inferred, "origin")
 
 
 if __name__ == "__main__":

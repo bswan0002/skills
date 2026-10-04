@@ -119,20 +119,48 @@ def comparison(base_sha, head_sha):
     }
 
 
+def publishing_remote(branch, remotes, explicit=None):
+    """Infer the remote that publishes the branch; returns (remote, source).
+
+    Follows git's push-remote precedence, but this is an inference, not exact git
+    behavior: push.default=nothing, remote.<name>.push refspecs, and matching
+    pushes can publish differently.
+    """
+    if explicit:
+        if explicit not in remotes:
+            raise DiscoveryError(f"Unknown head remote: {explicit}")
+        return explicit, "--head-remote"
+    if branch:
+        candidates = [
+            ("pushRemote", optional("git", "config", "--get", f"branch.{branch}.pushRemote")),
+            ("remote.pushDefault", optional("git", "config", "--get", "remote.pushDefault")),
+        ]
+        # The tracking remote publishes the branch when an implicit push sends it
+        # there under its own name: a same-named tracked branch, or push.default=current.
+        # Otherwise (tracking upstream/main under simple or upstream) git refuses or
+        # pushes it as another branch, so the tracking remote is following a parent.
+        same_name = optional("git", "config", "--get", f"branch.{branch}.merge") == f"refs/heads/{branch}"
+        if same_name or optional("git", "config", "--get", "push.default") == "current":
+            candidates.append(("tracking", optional("git", "config", "--get", f"branch.{branch}.remote")))
+        for source, name in candidates:
+            if name in remotes:
+                return name, source
+    return ("origin", "origin") if "origin" in remotes else (None, None)
+
+
 def discover(args):
     root = run("git", "rev-parse", "--show-toplevel")
     branch = run("git", "branch", "--show-current")
     head = run("git", "rev-parse", "HEAD")
     remote_names = run("git", "remote").splitlines()
     remotes = {name: run("git", "remote", "get-url", name) for name in remote_names}
-    upstream_remote = optional("git", "config", "--get", f"branch.{branch}.remote") if branch else None
-    head_remote = args.head_remote or upstream_remote or ("origin" if "origin" in remotes else None)
-    if args.head_remote and args.head_remote not in remotes:
-        raise DiscoveryError(f"Unknown head remote: {args.head_remote}")
-    head_repo = github_repo(remotes.get(head_remote, ""))
+    head_remote, head_remote_source = publishing_remote(branch, remotes, args.head_remote)
+    # Pushes go to the push URL, which may differ from the fetch URL.
+    head_repo = github_repo(run("git", "remote", "get-url", "--push", head_remote)) if head_remote else None
     result = {
         "repository_root": root, "branch": branch or None, "local_head": head,
         "working_tree": run("git", "status", "--short"), "remotes": remotes,
+        "head_remote": {"name": head_remote, "source": head_remote_source},
         "head_repository": head_repo, "parent_evidence": parent_evidence(branch),
         "errors": [],
     }
