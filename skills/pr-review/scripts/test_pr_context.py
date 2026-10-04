@@ -288,12 +288,75 @@ class RepositoryTests(unittest.TestCase):
         before = (self.git("show-ref"), self.git("status", "--porcelain"), Path(".git/shallow").read_text())
         result = self.discover(base=main_tip, fail=True)["comparison"]
         self.assertEqual(result["status"], "incomplete_history")
+        self.assertEqual(result["cause"], "no_merge_base")
         self.assertIn("--deepen=100", result["command_templates"][0])
         self.assertEqual(before, (self.git("show-ref"), self.git("status", "--porcelain"), Path(".git/shallow").read_text()))
         self.git("fetch", "--no-tags", "--deepen=100", source, main_tip, self.head)
         recovered = self.discover(base=main_tip, fail=True)["comparison"]
         self.assertEqual(recovered["status"], "ready")
         self.assertEqual(recovered["merge_base"], self.base)
+
+    def commit_file(self, name):
+        Path(name).write_text(f"{name}\n")
+        self.git("add", name)
+        self.git("commit", "-m", name)
+        return self.git("rev-parse", "HEAD")
+
+    def test_shallow_boundary_hiding_newer_merge_base(self):
+        # main: base -> upstream -> p1 -> p2 -> merge(side off base); feature off upstream.
+        # A depth-3 main reaches base through side but cuts p1 from upstream, so the
+        # visible merge-base is base while the real one is upstream.
+        self.git("switch", "main")
+        upstream = self.commit_file("upstream")
+        self.git("switch", "-C", "feature")
+        self.commit_file("feature-file")
+        self.git("switch", "main")
+        self.commit_file("p1")
+        self.commit_file("p2")
+        self.git("switch", "-c", "side", self.base)
+        self.commit_file("side")
+        self.git("switch", "main")
+        self.git("merge", "--no-edit", "side")
+        main_tip = self.git("rev-parse", "HEAD")
+        source = Path.cwd().as_uri()
+        clone = str(Path(self.temp.name) / "hidden-base")
+        self.git("clone", "--depth=3", "--single-branch", "-b", "main", source, clone)
+        os.chdir(clone)
+        self.git("fetch", source, "feature:feature")
+        self.git("switch", "feature")
+        self.assertEqual(self.git("merge-base", main_tip, "HEAD"), self.base)
+
+        result = self.discover(base=main_tip, fail=True)["comparison"]
+        self.assertEqual(result["status"], "incomplete_history")
+        self.assertEqual(result["cause"], "hidden_merge_base")
+        self.assertEqual(result["visible_merge_base"], self.base)
+        self.assertTrue(result["shallow_boundaries"])
+        self.assertIn("visible merge-base", result["note"])
+
+        self.git("fetch", "--no-tags", "--deepen=100", source, "main", "feature")
+        recovered = self.discover(base=main_tip, fail=True)["comparison"]
+        self.assertEqual(recovered["status"], "ready")
+        self.assertEqual(recovered["merge_base"], upstream)
+
+    def test_shallow_clone_with_visible_merge_base_stays_ready(self):
+        # Linear main deeper than the clone; the feature branch starts inside the depth.
+        self.git("switch", "main")
+        for index in range(6):
+            self.commit_file(f"m{index}")
+        fork_point = self.git("rev-parse", "HEAD")
+        self.git("switch", "-c", "recent", fork_point)
+        self.commit_file("recent-file")
+        self.git("switch", "main")
+        self.commit_file("m-after")
+        source = Path.cwd().as_uri()
+        clone = str(Path(self.temp.name) / "visible-base")
+        self.git("clone", "--depth=4", "--no-single-branch", source, clone)
+        os.chdir(clone)
+        self.git("switch", "recent")
+        self.assertEqual(self.git("rev-parse", "--is-shallow-repository"), "true")
+        result = self.discover(base="origin/main", fail=True)["comparison"]
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["merge_base"], fork_point)
 
     def test_shallow_pr_has_scoped_target_fetch(self):
         _, main_tip = self.shallow_clone()

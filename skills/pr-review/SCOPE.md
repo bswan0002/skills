@@ -39,7 +39,7 @@ One or both comparison commits are absent locally. Verify the source in `suggest
 
 ## incomplete_history
 
-A shallow clone hides the merge-base. Run the scoped deepening fetch and rerun, raising the `--deepen` increment while history stays incomplete. A shallow repository without a merge-base has not proven the histories unrelated; if deepening is unavailable, take the PR-diff fallback.
+A shallow clone hides the merge-base: none is visible (`cause: no_merge_base`), or a shallow boundary may hide a newer one than `visible_merge_base` (`cause: hidden_merge_base`). Run the scoped deepening fetch and rerun, raising the `--deepen` increment while history stays incomplete. A shallow repository has proven neither unrelated histories nor its visible merge-base; if deepening is unavailable, take the PR-diff fallback.
 
 ## historical_pr
 

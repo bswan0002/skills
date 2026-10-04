@@ -88,6 +88,43 @@ def lookup_pr(repo, branch, head_repo, requested=None):
     return {"status": "found", "pr": matches[0]} if matches else {"status": "absent"}
 
 
+SHALLOW_CAUSES = {
+    "no_merge_base": (
+        "Both tips exist, but shallow history may hide their common ancestor",
+        "Do not infer unrelated histories while the repository remains shallow.",
+    ),
+    "hidden_merge_base": (
+        "A merge-base was found, but a shallow boundary may hide a newer one",
+        "Do not review against the visible merge-base while these boundaries remain.",
+    ),
+}
+
+
+def hiding_boundaries(base_sha, head_sha, merge_base):
+    """Shallow boundary commits that could hide a newer merge-base.
+
+    A cut below the merge-base hides only older ancestors, so only boundaries
+    reachable from a tip but not from the merge-base matter.
+    """
+    with open(run("git", "rev-parse", "--git-path", "shallow")) as handle:
+        shallow = set(handle.read().split())
+    between = run("git", "rev-list", base_sha, head_sha, f"^{merge_base}").split()
+    return [sha for sha in between if sha in shallow]
+
+
+def incomplete_history(base_sha, head_sha, cause):
+    reason, caution = SHALLOW_CAUSES[cause]
+    return {
+        "status": "incomplete_history", "cause": cause, "base_sha": base_sha, "head_sha": head_sha,
+        "reason": reason,
+        "recovery": "Deepen only the comparison histories from a verified source, then rerun discovery. Repeat with a larger increment if necessary; no fetch was performed.",
+        "command_templates": [shlex.join([
+            "git", "fetch", "--no-tags", "--deepen=100", "<verified-source>", base_sha, head_sha,
+        ])],
+        "note": "Replace the source placeholder before running. If it cannot serve these commits (for example local-only work), deepen the remote branches containing their ancestors instead. " + caution,
+    }
+
+
 def comparison(base_sha, head_sha):
     missing = [sha for sha in (base_sha, head_sha) if not commit(sha)]
     if missing:
@@ -97,20 +134,19 @@ def comparison(base_sha, head_sha):
             "command_templates": [shlex.join(["git", "fetch", "--no-tags", "<verified-source>", *missing])],
             "note": "Replace the source placeholder with a remote verified to hold these commits, fetch, then rerun discovery; no fetch was performed.",
         }
+    shallow = run("git", "rev-parse", "--is-shallow-repository") == "true"
     merge_base = optional("git", "merge-base", base_sha, head_sha)
     if not merge_base:
-        if run("git", "rev-parse", "--is-shallow-repository") == "true":
-            return {
-                "status": "incomplete_history", "base_sha": base_sha, "head_sha": head_sha,
-                "reason": "Both tips exist, but shallow history may hide their common ancestor",
-                "recovery": "Deepen only the comparison histories from a verified source, then rerun discovery. Repeat with a larger increment if necessary; no fetch was performed.",
-                "command_templates": [shlex.join([
-                    "git", "fetch", "--no-tags", "--deepen=100", "<verified-source>", base_sha, head_sha,
-                ])],
-                "note": "Replace the source placeholder before running. If it cannot serve these commits (for example local-only work), deepen the remote branches containing their ancestors instead. Do not infer unrelated histories while the repository remains shallow.",
-            }
+        if shallow:
+            return incomplete_history(base_sha, head_sha, "no_merge_base")
         return {"status": "no_merge_base", "base_sha": base_sha, "head_sha": head_sha,
                 "reason": "Full history has no common ancestor: the base is wrong or the histories are unrelated"}
+    if shallow:
+        boundaries = hiding_boundaries(base_sha, head_sha, merge_base)
+        if boundaries:
+            result = incomplete_history(base_sha, head_sha, "hidden_merge_base")
+            result.update({"visible_merge_base": merge_base, "shallow_boundaries": boundaries})
+            return result
     span = f"{base_sha}...{head_sha}"
     return {
         "status": "ready", "base_sha": base_sha, "head_sha": head_sha,
@@ -218,7 +254,7 @@ def discover(args):
                     "git", "fetch", "--no-tags", "--deepen=100", f"https://github.com/{repo}.git",
                     f"refs/heads/{pr['baseRefName']}", f"refs/pull/{pr['number']}/head",
                 ])]
-                result["comparison"]["note"] = "Verify the source before fetching. For local unpublished work, additional ancestor history may be needed from its publishing remote. Do not infer unrelated histories while the repository remains shallow."
+                result["comparison"]["note"] = "Verify the source before fetching. For local unpublished work, additional ancestor history may be needed from its publishing remote. " + SHALLOW_CAUSES[result["comparison"]["cause"]][1]
             if result["comparison"]["status"] == "missing_objects":
                 result["comparison"].pop("command_templates")
                 fetch_refs = [f"refs/heads/{pr['baseRefName']}"]
