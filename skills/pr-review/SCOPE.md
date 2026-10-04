@@ -4,11 +4,24 @@ Reached from [SKILL.md](SKILL.md) when `comparison.status` is not `ready`. Every
 
 Recovery ends in the first of these that succeeds:
 
-1. Recover and rerun the helper until it reports `ready`.
-2. Fall back to the GitHub PR diff (`gh pr diff`) when a PR exists, recording the reduced context under **Limits**.
+1. Recover and rerun the helper until it reports a resolved status: `ready` or `historical_pr`.
+2. Take the PR-diff fallback when it is eligible or approved.
 3. Stop and report the status, `reason`, and `errors`.
 
-Present findings only on a resolved comparison or a disclosed PR-diff fallback.
+Present findings only on a resolved status or an eligible or approved PR-diff fallback.
+
+## PR-diff fallback
+
+Reviews the GitHub PR diff (`gh pr diff`) in place of a local comparison. Requires a PR; without one, stop.
+
+**Eligible** when both hold:
+
+- the base came from the PR (`base_selection.source` is `open_pr`);
+- the head is the PR's (`--pr`, or `local_head` equals `pr_lookup.pr.headRefOid`).
+
+**Scope change** otherwise (a custom base, or local commits beyond the PR head): proceed only with the user's approval.
+
+**Report** the PR's base and head as the comparison. Under **Limits**, record the reduced surrounding context and, for a scope change, what the fallback omits.
 
 ## needs_base
 
@@ -30,7 +43,7 @@ A shallow clone hides the merge-base. Run the scoped deepening fetch and rerun, 
 
 ## historical_pr
 
-A closed or merged PR reviewed without `--base`. Review the historical diff from the emitted `gh pr diff` command rather than today's target branch, and read surrounding code at `head_sha` (fetch it first when `suggested_fetches` is present). Pass `--base` only when the user asks for a custom comparison, and flag it in the report.
+A resolved status: a closed or merged PR reviewed without `--base`. Review the historical diff from the emitted `gh pr diff` command rather than today's target branch, and read surrounding code at `head_sha` (fetch it first when `suggested_fetches` is present; if the fetch fails, review the diff alone and record the missing context under **Limits**). Pass `--base` only when the user asks for a custom comparison, and flag it in the report.
 
 ## no_merge_base
 
