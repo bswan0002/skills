@@ -42,12 +42,13 @@ Then list **actionable** findings introduced by the changes, ordered by severity
 - `high`: wrong behavior or a regression on a common path.
 - `medium`: wrong behavior under an edge case or uncommon configuration.
 - `low`: a minor defect with limited impact or an easy workaround.
+- `nit`: a non-blocking stylistic inconsistency or readability/presentation issue with no behavioral impact.
 
 For each finding give:
 
 - **Severity and short title.**
 - **File and line**, pointing to the smallest relevant changed range.
-- **Trigger and impact**: the conditions under which it occurs and what breaks.
+- **Trigger and impact**: the conditions under which it occurs and what breaks; nits excluded.
 - **Suggested fix**, briefly, when useful.
 
 List uncertain concerns after the findings, each with the evidence that would settle it. With no actionable findings, say so; the header's limits keep that from claiming the code is proven correct.
