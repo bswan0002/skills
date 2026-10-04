@@ -86,7 +86,12 @@ def lookup_pr(repo, branch, head_repo, requested=None):
 def comparison(base_sha, head_sha):
     missing = [sha for sha in (base_sha, head_sha) if not commit(sha)]
     if missing:
-        return {"status": "missing_objects", "commits": missing}
+        return {
+            "status": "missing_objects", "base_sha": base_sha, "head_sha": head_sha, "commits": missing,
+            "reason": "Comparison commits are not present locally",
+            "command_templates": [shlex.join(["git", "fetch", "--no-tags", "<verified-source>", *missing])],
+            "note": "Replace the source placeholder with a remote verified to hold these commits, fetch, then rerun discovery; no fetch was performed.",
+        }
     merge_base = optional("git", "merge-base", base_sha, head_sha)
     if not merge_base:
         if run("git", "rev-parse", "--is-shallow-repository") == "true":
@@ -99,7 +104,8 @@ def comparison(base_sha, head_sha):
                 ])],
                 "note": "Replace the source placeholder before running. If it cannot serve these commits (for example local-only work), deepen the remote branches containing their ancestors instead. Do not infer unrelated histories while the repository remains shallow.",
             }
-        return {"status": "no_merge_base"}
+        return {"status": "no_merge_base", "base_sha": base_sha, "head_sha": head_sha,
+                "reason": "Full history has no common ancestor: the base is wrong or the histories are unrelated"}
     span = f"{base_sha}...{head_sha}"
     return {
         "status": "ready", "base_sha": base_sha, "head_sha": head_sha,
@@ -144,8 +150,14 @@ def discover(args):
     if args.pr and pr["state"] != "OPEN" and not args.base:
         result["comparison"] = {
             "status": "historical_pr", "reason": "Use the historical PR diff, not today's target branch",
+            "head_sha": pr["headRefOid"],
             "commands": [shlex.join(["gh", "pr", "diff", str(pr["number"]), "--repo", repo])],
         }
+        if not commit(pr["headRefOid"]):
+            result["comparison"]["suggested_fetches"] = [shlex.join([
+                "git", "fetch", "--no-tags", f"https://github.com/{repo}.git", f"refs/pull/{pr['number']}/head",
+            ])]
+            result["comparison"]["note"] = "head_sha is not local; fetch it to read surrounding code, then rerun discovery. No fetch was performed."
         return result
     review_head = pr["headRefOid"] if args.pr else head
     if args.base:
@@ -168,6 +180,7 @@ def discover(args):
                 ])]
                 result["comparison"]["note"] = "Verify the source before fetching. For local unpublished work, additional ancestor history may be needed from its publishing remote. Do not infer unrelated histories while the repository remains shallow."
             if result["comparison"]["status"] == "missing_objects":
+                result["comparison"].pop("command_templates")
                 fetch_refs = [f"refs/heads/{pr['baseRefName']}"]
                 if args.pr:
                     fetch_refs.append(f"refs/pull/{pr['number']}/head")
@@ -193,7 +206,7 @@ def main():
     try:
         result = discover(args)
     except (DiscoveryError, OSError, ValueError, KeyError) as exc:
-        print(json.dumps({"errors": [str(exc)], "comparison": {"status": "blocked"}}, indent=2))
+        print(json.dumps({"errors": [str(exc)], "comparison": {"status": "blocked", "reason": "Discovery failed before a comparison could be built; see errors"}}, indent=2))
         return 1
     print(json.dumps(result, indent=2))
     return 0 if result["comparison"]["status"] in ("ready", "historical_pr") else 1

@@ -125,6 +125,15 @@ class RepositoryTests(unittest.TestCase):
     def test_historical_pr_does_not_use_live_target(self):
         result = self.discover(prs=[pr(state="MERGED")], requested="1")
         self.assertEqual(result["comparison"]["status"], "historical_pr")
+        self.assertEqual(result["comparison"]["head_sha"], "published-head")
+        self.assertIn("refs/pull/1/head", result["comparison"]["suggested_fetches"][0])
+
+    def test_historical_pr_with_local_head_needs_no_fetch(self):
+        data = pr(state="MERGED")
+        data["headRefOid"] = self.head
+        result = self.discover(prs=[data], requested="1")["comparison"]
+        self.assertEqual(result["head_sha"], self.head)
+        self.assertNotIn("suggested_fetches", result)
 
     def test_explicit_base_overrides_historical_target(self):
         data = pr(state="MERGED")
@@ -157,7 +166,16 @@ class RepositoryTests(unittest.TestCase):
         result = self.discover(prs=[pr()], live_base="a" * 40)
         self.assertEqual(result["comparison"]["status"], "missing_objects")
         self.assertIn("team/project.git", result["comparison"]["suggested_fetches"][0])
+        self.assertNotIn("command_templates", result["comparison"])
         self.assertEqual(self.git("show-ref"), before)
+
+    def test_missing_objects_with_explicit_base_has_template(self):
+        data = pr()
+        data["headRefOid"] = "b" * 40
+        result = self.discover(prs=[data], requested="1", base="main")["comparison"]
+        self.assertEqual(result["status"], "missing_objects")
+        self.assertEqual(result["command_templates"], [f"git fetch --no-tags '<verified-source>' {'b' * 40}"])
+        self.assertTrue(result["reason"])
 
     def test_linked_worktree(self):
         path = str(Path(self.temp.name) / "linked")
@@ -206,7 +224,9 @@ class RepositoryTests(unittest.TestCase):
     def test_unrelated_histories_block(self):
         self.git("switch", "--orphan", "unrelated")
         self.git("commit", "--allow-empty", "-m", "unrelated")
-        self.assertEqual(self.discover(base="main")["comparison"]["status"], "no_merge_base")
+        result = self.discover(base="main")["comparison"]
+        self.assertEqual(result["status"], "no_merge_base")
+        self.assertTrue(result["reason"])
 
 
 if __name__ == "__main__":

@@ -1,50 +1,55 @@
 ---
 name: pr-review
-description: Review a pull request or the current branch for actionable bugs and regressions. Use when asked for a PR review, branch review, or a check before merging.
+description: Reviews changes for actionable bugs and regressions before merge. Use when asked for a PR review, branch review, or pre-merge check.
 ---
 
-Review the changes intended for merge. Leave code and working-tree files unchanged; fixes require a separate request.
+Review the changes intended for merge. The review is **read-only**: leave the checkout, index, working-tree files, and external state (PR comments, pushes, remote refs) as you found them. Fetching Git objects and refs is the one permitted write. Fixes require a separate request.
 
-## Establish the scope
+## Scope
 
-Read the repository's agent instructions. From its worktree, run the helper using its absolute path resolved relative to **this skill**, not the target repository:
+From the target worktree, run the helper by its absolute path under this skill's base directory, not the target repository's (`--help` lists `--base`, `--pr`, `--repo`, `--head-remote`):
 
 ```bash
-python3 /absolute/path/to/pr-review/scripts/pr-context.py
-# Optional: explicit comparison, PR, target repository, or publishing remote
-python3 /absolute/path/to/pr-review/scripts/pr-context.py --base parent-branch
-python3 /absolute/path/to/pr-review/scripts/pr-context.py --pr 123 --repo owner/repo
+python3 <skill-dir>/scripts/pr-context.py
 ```
 
-Requires Python 3.9+, git, and authenticated gh for GitHub discovery. The helper is read-only: it reports status, remotes, PR lookup results, parent evidence, and fixed-commit diff commands. It never fetches or guesses a parent. A nonzero exit means the local comparison is not ready; read the JSON reason.
+Only these establish the base, in order: **user-specified base → open PR's target → unambiguous, history-corroborated local parent evidence → ask the user**. A tracking upstream, nearest merge-base, conventional branch name, or `HEAD~1` is not parent evidence.
 
-Choose the base in this order: **user-specified base → open PR's target → unambiguous, history-corroborated local parent evidence → ask**. The helper resolves the first two; evaluate its raw metadata/reflogs for the third and rerun with `--base` only once the parent is established. Creation from `HEAD` needs checkout-history correlation. Conflicting or incomplete evidence requires clarification.
+On every run, check `pr_lookup` and `errors` whatever the comparison status. A `failed` lookup is an error to report under **Limits**, not an absent PR; for `ambiguous`, ask which PR is meant and rerun with `--pr`. Confirm `target_repository` and `head_repository` name the repositories you mean to review; correct them with `--repo` or `--head-remote`.
 
-Verify the reported target and head repository identities. `--head-remote` overrides the publishing remote (tracking remote, otherwise origin); `--repo` overrides gh's target repository. A tracking upstream, nearest merge-base, conventional branch name, or `HEAD~1` does not establish the parent.
+The default reviews committed local `HEAD`; `--pr` reviews the published PR head. Include uncommitted changes only on request, reported separately. When `base_selection.freshness` says the base is local-only, check it against its remote before relying on it.
 
-Surface lookup errors rather than treating them as no PR. Another source may establish scope independently. Explicit bases resolve locally: check remote freshness separately when reviewing against a live remote branch. Disclose a custom comparison if the requested base differs from the PR target.
-
-## Resolve the comparison
-
-If the helper reports missing objects, verify its suggested fetch source, fetch only the required refs, and rerun. Fetching Git objects/refs is allowed; leave the checkout, index, and working-tree files unchanged. Report failures instead of silently using stale refs. If objects remain unavailable, use the GitHub PR diff and disclose limits on surrounding context.
-
-For `incomplete_history`, deepen the comparison histories using the suggested scoped fetch or a command template with a verified source substituted, then rerun. Increase the depth increment if needed. A shallow repository without a merge-base does not establish unrelated histories; if recovery is unavailable, use the PR diff or report the limitation.
-
-The default reviews committed local `HEAD`; `--pr` reviews the published PR head. Closed/merged PRs use the historical PR diff unless a custom base was requested. Keep uncommitted changes separate and include them only when requested.
-
-Use the emitted fixed-SHA commands throughout the review. Three-dot excludes target-only changes. Stop if the comparison cannot be resolved. State base, head, selection evidence, and scope exclusions before presenting findings.
+When `comparison.status` is `ready`, use its emitted commands throughout. For any other status, read [SCOPE.md](SCOPE.md) under that status first.
 
 ## Review
 
-Read the full diff and relevant surrounding code. Follow changed behavior through callers, dependencies, and tests as needed to establish whether an issue is real. Inspect repository conventions rather than imposing personal preferences.
+Read the full diff. Read surrounding code at `head_sha` (`git show <head_sha>:<path>`, `git grep <pattern> <head_sha>`); the working tree may hold another branch or uncommitted edits. Trace changed behavior through callers, dependencies, and tests until each suspected issue is confirmed or ruled out, judging against the repository's conventions and agent instructions.
 
-Prioritize correctness, regressions, security, data loss, concurrency, and compatibility. Flag a missing test when it leaves a concrete changed behavior unprotected, not as generic advice. Run checks only when they will not modify files or external state; otherwise explain what remains unverified.
+Prioritize correctness, regressions, security, data loss, concurrency, and compatibility. A missing test is a finding when it leaves a concrete changed behavior unprotected. Run checks only when they are read-only; record the rest as unverified.
 
-Report actionable issues introduced by the changes. For each finding, give:
+The review is done when every file in `--name-status` is either reviewed or listed as excluded with a reason.
 
-- **Severity and short title** (`critical`, `high`, `medium`, or `low`).
+## Report
+
+Open with a scope header:
+
+- **Base and head**: refs and SHAs.
+- **Base selection**: the source and its evidence; flag a custom comparison when the base differs from the PR target.
+- **Exclusions**: skipped files and uncommitted changes, with reasons.
+- **Limits**: PR lookup errors, unverified behavior, unrun checks, and reduced context such as a PR-diff fallback.
+
+Then list **actionable** findings introduced by the changes, ordered by severity:
+
+- `critical`: data loss, security exposure, or a broken primary path in normal use.
+- `high`: wrong behavior or a regression on a common path.
+- `medium`: wrong behavior under an edge case or uncommon configuration.
+- `low`: a minor defect with limited impact or an easy workaround.
+
+For each finding give:
+
+- **Severity and short title.**
 - **File and line**, pointing to the smallest relevant changed range.
-- **Trigger and impact:** the conditions under which the problem occurs and what breaks.
+- **Trigger and impact**: the conditions under which it occurs and what breaks.
 - **Suggested fix**, briefly, when useful.
 
-Separate uncertain concerns from confirmed findings and identify the evidence needed to settle them. Skip style nits and generic advice. If no actionable issues are found, say so; include material review limits or unverified behavior without implying the code is proven correct.
+List uncertain concerns after the findings, each with the evidence that would settle it. With no actionable findings, say so; the header's limits keep that from claiming the code is proven correct.
