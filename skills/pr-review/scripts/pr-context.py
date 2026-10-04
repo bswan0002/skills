@@ -89,6 +89,16 @@ def comparison(base_sha, head_sha):
         return {"status": "missing_objects", "commits": missing}
     merge_base = optional("git", "merge-base", base_sha, head_sha)
     if not merge_base:
+        if run("git", "rev-parse", "--is-shallow-repository") == "true":
+            return {
+                "status": "incomplete_history", "base_sha": base_sha, "head_sha": head_sha,
+                "reason": "Both tips exist, but shallow history may hide their common ancestor",
+                "recovery": "Deepen only the comparison histories from a verified source, then rerun discovery. Repeat with a larger increment if necessary; no fetch was performed.",
+                "command_templates": [shlex.join([
+                    "git", "fetch", "--no-tags", "--deepen=100", "<verified-source>", base_sha, head_sha,
+                ])],
+                "note": "Replace the source placeholder before running. If it cannot serve these commits (for example local-only work), deepen the remote branches containing their ancestors instead. Do not infer unrelated histories while the repository remains shallow.",
+            }
         return {"status": "no_merge_base"}
     span = f"{base_sha}...{head_sha}"
     return {
@@ -150,6 +160,13 @@ def discover(args):
             base_sha = json.loads(run("gh", "api", endpoint))["object"]["sha"]
             result["base_selection"] = {"source": "open_pr", "ref": pr["baseRefName"], "sha": base_sha, "repository": repo}
             result["comparison"] = comparison(base_sha, review_head)
+            if result["comparison"]["status"] == "incomplete_history":
+                result["comparison"].pop("command_templates")
+                result["comparison"]["suggested_fetches"] = [shlex.join([
+                    "git", "fetch", "--no-tags", "--deepen=100", f"https://github.com/{repo}.git",
+                    f"refs/heads/{pr['baseRefName']}", f"refs/pull/{pr['number']}/head",
+                ])]
+                result["comparison"]["note"] = "Verify the source before fetching. For local unpublished work, additional ancestor history may be needed from its publishing remote. Do not infer unrelated histories while the repository remains shallow."
             if result["comparison"]["status"] == "missing_objects":
                 fetch_refs = [f"refs/heads/{pr['baseRefName']}"]
                 if args.pr:

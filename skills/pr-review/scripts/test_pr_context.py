@@ -166,6 +166,43 @@ class RepositoryTests(unittest.TestCase):
         result = self.discover(base="main")
         self.assertEqual(result["comparison"]["status"], "ready")
 
+    def shallow_clone(self):
+        # Diverging tips share the original base only in full history.
+        self.git("switch", "main")
+        Path("main-file").write_text("main work\n")
+        self.git("add", "main-file")
+        self.git("commit", "-m", "main work")
+        main_tip = self.git("rev-parse", "HEAD")
+        source = Path.cwd().as_uri()
+        clone = str(Path(self.temp.name) / "shallow-clone")
+        self.git("clone", "--depth=1", "--no-single-branch", source, clone)
+        os.chdir(clone)
+        self.git("switch", "feature")
+        return source, main_tip
+
+    def test_shallow_history_recovers_after_scoped_deepening(self):
+        source, main_tip = self.shallow_clone()
+        self.assertEqual(self.git("rev-parse", "--is-shallow-repository"), "true")
+        self.assertEqual(context.commit(main_tip), main_tip)
+        self.assertEqual(context.commit(self.head), self.head)
+        before = (self.git("show-ref"), self.git("status", "--porcelain"), Path(".git/shallow").read_text())
+        result = self.discover(base=main_tip, fail=True)["comparison"]
+        self.assertEqual(result["status"], "incomplete_history")
+        self.assertIn("--deepen=100", result["command_templates"][0])
+        self.assertEqual(before, (self.git("show-ref"), self.git("status", "--porcelain"), Path(".git/shallow").read_text()))
+        self.git("fetch", "--no-tags", "--deepen=100", source, main_tip, self.head)
+        recovered = self.discover(base=main_tip, fail=True)["comparison"]
+        self.assertEqual(recovered["status"], "ready")
+        self.assertEqual(recovered["merge_base"], self.base)
+
+    def test_shallow_pr_has_scoped_target_fetch(self):
+        _, main_tip = self.shallow_clone()
+        self.git("remote", "set-url", "origin", "git@github.com:me/project.git")
+        result = self.discover(prs=[pr()], live_base=main_tip)["comparison"]
+        self.assertEqual(result["status"], "incomplete_history")
+        self.assertNotIn("command_templates", result)
+        self.assertIn("--deepen=100 https://github.com/team/project.git refs/heads/main refs/pull/1/head", result["suggested_fetches"][0])
+
     def test_unrelated_histories_block(self):
         self.git("switch", "--orphan", "unrelated")
         self.git("commit", "--allow-empty", "-m", "unrelated")

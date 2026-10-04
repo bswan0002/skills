@@ -28,6 +28,8 @@ Surface lookup errors rather than treating them as no PR. Another source may est
 
 If the helper reports missing objects, verify its suggested fetch source, fetch only the required refs, and rerun. Fetching Git objects/refs is allowed; leave the checkout, index, and working-tree files unchanged. Report failures instead of silently using stale refs. If objects remain unavailable, use the GitHub PR diff and disclose limits on surrounding context.
 
+For `incomplete_history`, deepen the comparison histories using the suggested scoped fetch or a command template with a verified source substituted, then rerun. Increase the depth increment if needed. A shallow repository without a merge-base does not establish unrelated histories; if recovery is unavailable, use the PR diff or report the limitation.
+
 The default reviews committed local `HEAD`; `--pr` reviews the published PR head. Closed/merged PRs use the historical PR diff unless a custom base was requested. Keep uncommitted changes separate and include them only when requested.
 
 Use the emitted fixed-SHA commands throughout the review. Three-dot excludes target-only changes. Stop if the comparison cannot be resolved. State base, head, selection evidence, and scope exclusions before presenting findings.
