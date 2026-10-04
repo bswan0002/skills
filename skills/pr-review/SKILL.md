@@ -1,6 +1,6 @@
 ---
 name: pr-review
-description: Reviews published GitHub pull requests for actionable bugs and regressions. Use when asked for a PR review or a PR's pre-merge check.
+description: Use when asked to review a published GitHub pull request.
 ---
 
 Review the **published PR**, not local `HEAD` or uncommitted changes. The review is **read-only**: leave the checkout, index, working-tree files, and external state (PR comments, pushes, remote refs) as you found them. Fetching Git objects and refs is the one permitted write. Fixes require a separate request.
@@ -13,20 +13,26 @@ From the target worktree, run the helper by its absolute path under this skill's
 python3 <skill-dir>/scripts/pr-context.py
 ```
 
-The helper uses `gh pr status` to discover a candidate and `gh pr list` to verify open matches. Check its `status`:
+Handle the helper's `status`:
 
-- **`found`**: confirm the intended PR and repository, then run `diff_command` (`gh pr diff <PR-URL>`).
+- **`found`**: proceed with the discovered PR and repository when the target is clear; otherwise ask which PR to review. Then run `diff_command`.
 - **`ambiguous`**: ask which listed PR to review and rerun with `--pr`.
 - **`needs_pr`**: ask for a PR; unresolved discovery does not prove no PR exists.
 - **`failed`**: report the error and stop until it is resolved.
 
 ## Review
 
-Read the full PR diff. Read surrounding code at `pr.headRefOid` (`git show <sha>:<path>`, `git grep <pattern> <sha>`), not the working tree. If the commit is missing, fetch `refs/pull/<number>/head` from the target repository without changing the checkout; if unavailable, disclose the missing context. Trace changed behavior through callers, dependencies, and tests until each suspected issue is confirmed or ruled out, judging against the repository's conventions and agent instructions. If the PR changes during review, refresh its metadata and diff before reporting.
+Use `gh pr view <PR-URL> --json files` as the file checklist.
+
+Read the full PR diff. Read surrounding code at `pr.headRefOid` (`git show <sha>:<path>`, `git grep <pattern> <sha>`), not the working tree. If the commit is missing, fetch `refs/pull/<number>/head` from the target repository without changing the checkout; if unavailable, disclose the missing context.
+
+For each behavioral change, trace affected callers and dependencies, examine relevant tests, and account for compatibility. Confirm or rule out each suspected issue, judging against the repository's conventions and agent instructions.
 
 Prioritize correctness, regressions, security, data loss, concurrency, and compatibility. A missing test is a finding when it leaves a concrete changed behavior unprotected. Run checks only when they are read-only; record the rest as unverified.
 
-Use `gh pr view <PR-URL> --json files` as the file checklist. The review is done when every changed file is either reviewed or listed as excluded with a reason.
+The review is done when every changed file is either reviewed or listed as excluded with a reason.
+
+Before reporting, re-read the PR's published head and base SHAs. If either changed, refresh the metadata, diff, and file checklist, then revisit affected conclusions.
 
 ## Report
 
