@@ -37,6 +37,8 @@ Choose a skill for your task:
 - [grill-me](skills/grill-me/SKILL.md): Stress-test a plan or decision through questions. Adapted from [Matt Pocock](skills/grill-me/ATTRIBUTION.md)
 - [pr-review](skills/pr-review/SKILL.md): Review a published GitHub pull request without changing it
 - [qq](skills/qq/SKILL.md): Answer questions without making changes
+- [technical-writing](skills/technical-writing/SKILL.md): Write and review docs, READMEs, RFCs, PR descriptions, and commit messages to a layered standard. Adapted from [poteto](skills/technical-writing/ATTRIBUTION.md)
+- [unslop](skills/unslop/SKILL.md): Cut AI tells from any writing. Copied from [poteto](skills/unslop/ATTRIBUTION.md)
 - [writing-for-agents](skills/writing-for-agents/SKILL.md): Write skills and other documents for agents. Copied from [Matt Pocock](skills/writing-for-agents/ATTRIBUTION.md)
 
 ## License
