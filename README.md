@@ -34,6 +34,7 @@ npx skills update
 
 Choose a skill for your task:
 
+- [create-or-update-pr](skills/create-or-update-pr/SKILL.md): Propose and publish GitHub PRs with approval, alongside available PR guidance
 - [grill-me](skills/grill-me/SKILL.md): Stress-test a plan or decision through questions. Adapted from [Matt Pocock](skills/grill-me/ATTRIBUTION.md)
 - [pr-review](skills/pr-review/SKILL.md): Review a published GitHub pull request without changing it
 - [qq](skills/qq/SKILL.md): Answer questions without making changes
