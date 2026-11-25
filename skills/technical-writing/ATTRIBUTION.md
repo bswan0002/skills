@@ -4,7 +4,9 @@ Written by Lauren Tan ([poteto](https://x.com/poteto)). Adapted from [pstack](ht
 
 Licensed under the MIT License; see [LICENSE](LICENSE). Attribution and license files are local additions.
 
-Changes from upstream, limited to what is specific to Cursor or pstack:
+Changes from upstream:
+
+- Agents can load the skill themselves. Upstream disables model invocation, so only a user typing `/technical-writing` could start it.
 
 - The unslop reference links to [`../unslop/SKILL.md`](../unslop/SKILL.md). Upstream unslop disables model invocation, so the agent reads its file directly.
 - The PR description rule no longer mentions swarm logs, which come from pstack's `swarm` skill.
